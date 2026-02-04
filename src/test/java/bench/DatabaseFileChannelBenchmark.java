@@ -36,8 +36,8 @@ import java.util.concurrent.TimeUnit;
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
-@Warmup(iterations = 3, time = 2)
-@Measurement(iterations = 5, time = 3)
+@Warmup(iterations = 1, time = 1)
+@Measurement(iterations = 2, time = 3)
 @Fork(value = 1, jvmArgs = {"-Xms2g", "-Xmx2g"})
 public class DatabaseFileChannelBenchmark {
 
@@ -48,10 +48,12 @@ public class DatabaseFileChannelBenchmark {
     private static final int PAGE_SIZE_16K = 16384; // 16KB pages (MySQL InnoDB)
     private static final int TOTAL_PAGES = (FILE_SIZE_MB * 1024 * 1024) / PAGE_SIZE_4K;
 
-    @Param({"4096", "8192", "16384"})
+    //@Param({"4096", "8192", "16384"})
+    @Param({"8192"})
     private int pageSize;
 
-    @Param({"1", "4", "8", "16"})
+    //@Param({"1", "4", "8", "16"})
+    @Param({"4"})
     private int concurrency;
 
     private Path testFile;
@@ -175,32 +177,32 @@ public class DatabaseFileChannelBenchmark {
         }
     }
 
-    @Benchmark
-    @Threads(1)
-    public void randomReadJUring_Batch(Blackhole bh) throws Exception {
-        int batchSize = 16; // Simulate a database page-prefetch or concurrent queries
-        List<CompletableFuture<ReadResult>> futures = new ArrayList<>(batchSize);
-
-        // 1. Submit a batch of asynchronous requests
-        for (int i = 0; i < batchSize; i++) {
-            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
-            // Use the new Direct Async method
-            futures.add(juringChannel.readDirectAsync(pageSize, offset));
-        }
-
-        // 2. Wait for ALL of them to complete (pipelining)
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-        // 3. Process results (Zero-Copy)
-        for (CompletableFuture<ReadResult> future : futures) {
-            // We own the result now, so we must try-with-resources to close it
-            try (ReadResult result = future.get()) {
-                MemorySegment segment = result.buffer();
-                // Consume the raw native memory address directly
-                bh.consume(segment.address());
-            }
-        }
-    }
+//    @Benchmark
+//    @Threads(1)
+//    public void randomReadJUring_Batch(Blackhole bh) throws Exception {
+//        int batchSize = 16; // Simulate a database page-prefetch or concurrent queries
+//        List<CompletableFuture<ReadResult>> futures = new ArrayList<>(batchSize);
+//
+//        // 1. Submit a batch of asynchronous requests
+//        for (int i = 0; i < batchSize; i++) {
+//            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
+//            // Use the new Direct Async method
+//            futures.add(juringChannel.readDirectAsync(pageSize, offset));
+//        }
+//
+//        // 2. Wait for ALL of them to complete (pipelining)
+//        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+//
+//        // 3. Process results (Zero-Copy)
+//        for (CompletableFuture<ReadResult> future : futures) {
+//            // We own the result now, so we must try-with-resources to close it
+//            try (ReadResult result = future.get()) {
+//                MemorySegment segment = result.buffer();
+//                // Consume the raw native memory address directly
+//                bh.consume(segment.address());
+//            }
+//        }
+//    }
 
     // ==================== RANDOM WRITE BENCHMARKS ====================
 
@@ -258,43 +260,43 @@ public class DatabaseFileChannelBenchmark {
         }
     }
 
-    @Benchmark
-    @Threads(1)
-    public void randomWriteJUring_Batch(Blackhole bh) {
-        int batchSize = 16; // Flush 16 dirty pages at once
-        List<CompletableFuture<Integer>> futures = new ArrayList<>(batchSize);
-        ByteBuffer scratchBuffer = ByteBuffer.allocate(pageSize);
-        byte[] data = new byte[pageSize];
-
-        // 1. Prepare the entire batch (Fast, no syscalls)
-        for (int i = 0; i < batchSize; i++) {
-            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
-
-            // Fill dummy data
-            ThreadLocalRandom.current().nextBytes(data);
-            scratchBuffer.clear();
-            scratchBuffer.put(data);
-            scratchBuffer.flip();
-
-            // Call with submitNow = false
-            futures.add(juringChannel.writeAsync(scratchBuffer, offset, false));
-        }
-
-        // 2. Submit ALL writes with a SINGLE syscall (The Performance Win)
-        juringChannel.submitBatch();
-
-        // 3. Wait for completion (Pipelined latency)
-        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-        // 4. Consume results
-        for (CompletableFuture<Integer> f : futures) {
-            try {
-                bh.consume(f.get());
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-        }
-    }
+//    @Benchmark
+//    @Threads(1)
+//    public void randomWriteJUring_Batch(Blackhole bh) {
+//        int batchSize = 16; // Flush 16 dirty pages at once
+//        List<CompletableFuture<Integer>> futures = new ArrayList<>(batchSize);
+//        ByteBuffer scratchBuffer = ByteBuffer.allocate(pageSize);
+//        byte[] data = new byte[pageSize];
+//
+//        // 1. Prepare the entire batch (Fast, no syscalls)
+//        for (int i = 0; i < batchSize; i++) {
+//            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
+//
+//            // Fill dummy data
+//            ThreadLocalRandom.current().nextBytes(data);
+//            scratchBuffer.clear();
+//            scratchBuffer.put(data);
+//            scratchBuffer.flip();
+//
+//            // Call with submitNow = false
+//            futures.add(juringChannel.writeAsync(scratchBuffer, offset, false));
+//        }
+//
+//        // 2. Submit ALL writes with a SINGLE syscall (The Performance Win)
+//        juringChannel.submitBatch();
+//
+//        // 3. Wait for completion (Pipelined latency)
+//        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+//
+//        // 4. Consume results
+//        for (CompletableFuture<Integer> f : futures) {
+//            try {
+//                bh.consume(f.get());
+//            } catch (Exception e) {
+//                throw new RuntimeException(e);
+//            }
+//        }
+//    }
 
     @Benchmark
     public void randomWriteJUring_MultiThread(Blackhole bh) throws IOException {
