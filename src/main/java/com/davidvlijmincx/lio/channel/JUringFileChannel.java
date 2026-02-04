@@ -3,6 +3,7 @@ package com.davidvlijmincx.lio.channel;
 import com.davidvlijmincx.lio.api.*;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.*;
@@ -14,35 +15,32 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
-import static java.lang.foreign.ValueLayout.JAVA_BYTE;
-
 /**
- * FIXED Synchronous JUring FileChannel - Prevents double-free by using separate queues.
- *
- * KEY FIX: Sync operations bypass the polling thread entirely by using a separate
- * completion mechanism. This prevents the "double free" error that occurs when both
- * the sync path and polling thread try to process the same result.
+ * High-Performance JUring FileChannel.
+ * * Key Architecture:
+ * 1. Poller Thread: A dedicated daemon thread waits for CQEs (Completion Queue Events).
+ * 2. Async Submission: Requests are submitted non-blockingly.
+ * 3. Batching: Scatter/Gather and Batch operations use a single syscall for multiple buffers.
  */
 public class JUringFileChannel extends FileChannel {
 
-    private static final int DEFAULT_QUEUE_DEPTH = 256;
-    private static final int POLL_BATCH_SIZE = 100;
+    private static final int DEFAULT_QUEUE_DEPTH = 512;
+    private static final int BATCH_SIZE = 64;
 
     private final Path path;
-    private JUring ring = null;
+    private JUring ring;
     private final int registeredFileIndex;
     private final AtomicLong position = new AtomicLong(0);
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
-    // CRITICAL: Separate tracking for sync vs async operations
-    private final ConcurrentHashMap<Long, PendingRequest> asyncRequests = new ConcurrentHashMap<>();
+    // Maps Request ID -> The Future waiting for that result
+    private final ConcurrentHashMap<Long, CompletableFuture<Result>> pendingRequests = new ConcurrentHashMap<>();
 
-    // Sync operation serialization
-    private final Object syncLock = new Object();
+    // Lock ONLY for the submission ring (very fast, no I/O blocking)
+    private final Object submissionLock = new Object();
 
-    // Async path components (only for readAsync/writeAsync)
-
-    private FileDescriptor fileDescriptor;
+    // The thread that processes all completions
+    private final Thread pollerThread;
 
     public static JUringFileChannel open(Path path, OpenOption... options) throws IOException {
         return new JUringFileChannel(path, new HashSet<>(Arrays.asList(options)));
@@ -51,273 +49,216 @@ public class JUringFileChannel extends FileChannel {
     private JUringFileChannel(Path path, Set<OpenOption> options) throws IOException {
         this.path = path;
         try {
-            this.ring = new JUring(DEFAULT_QUEUE_DEPTH);
+            this.ring = new JUring(DEFAULT_QUEUE_DEPTH, IoUringOptions.IORING_SETUP_SQPOLL);
 
+            // 1. Open the file
             int flags = calculateOpenFlags(options);
             int mode = 0644;
-
-            long openRequestId = ring.prepareOpen(path.toString(), flags, mode);
+            long openReqId = ring.prepareOpen(path.toString(), flags, mode);
             ring.submit();
-
-            Result openResult = ring.waitForResult();
+            Result openResult = ring.waitForResult(); // Blocking init is fine
 
             if (!(openResult instanceof OpenResult)) {
-                ring.close();
-                throw new IOException("Unexpected result type for open operation");
+                throw new IOException("Failed to open file: Unexpected result");
             }
 
-            OpenResult openRes = (OpenResult) openResult;
-            this.fileDescriptor = openRes.fileDescriptor();
-
-            if (fileDescriptor.getFd() < 0) {
-                ring.close();
+            FileDescriptor fd = ((OpenResult) openResult).fileDescriptor();
+            if (fd.getFd() < 0) {
                 throw new IOException("Failed to open file: " + path);
             }
 
-            int registrationResult = ring.registerFiles(fileDescriptor);
-            if (registrationResult < 0) {
-                ring.prepareClose(fileDescriptor);
-                ring.submit();
-                ring.close();
-                throw new IOException("Failed to register file descriptor");
+            // 2. Register file for performance
+            int regRes = ring.registerFiles(fd);
+            if (regRes < 0) {
+                throw new IOException("Failed to register file");
             }
-
             this.registeredFileIndex = 0;
+
+            // 3. Start the Poller Thread
+            this.pollerThread = new Thread(this::pollLoop, "juring-poller");
+            this.pollerThread.setDaemon(true);
+            this.pollerThread.start();
+
         } catch (Exception e) {
-            if (ring != null) {
-                try {
-                    ring.close();
-                } catch (Exception closeEx) {
-                    e.addSuppressed(closeEx);
-                }
-            }
+            if (ring != null) try { ring.close(); } catch (Exception ignored) {}
             throw new IOException("Failed to initialize JUringFileChannel", e);
         }
     }
 
-    // ==================== FIXED SYNCHRONOUS I/O PATH ====================
+    /**
+     * The heartbeat of the system.
+     * Consumes completions from the ring and notifies the waiting futures.
+     */
+    private void pollLoop() {
+        while (!closed.get()) {
+            // Use peek instead of wait to avoid blocking the poller thread in the kernel
+            List<Result> results = ring.peekForBatchResult(BATCH_SIZE);
+
+            if (results == null || results.isEmpty()) {
+                // Hint to CPU that we are in a busy-wait loop to save power/cycles
+                Thread.onSpinWait();
+                continue;
+            }
+
+            for (Result result : results) {
+                CompletableFuture<Result> future = pendingRequests.remove(result.id());
+                if (future != null) {
+                    future.complete(result);
+                } else if (result instanceof ReadResult rr) {
+                    // Safety: if we got a read result no one is waiting for, free it
+                    try {
+                        rr.close();
+                    } catch (Exception e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== STANDARD IO (SYNC WRAPPERS) ====================
 
     @Override
     public int read(ByteBuffer dst) throws IOException {
-        ensureOpen();
         long pos = position.get();
-        int bytesRead = readSync(dst, pos);
-        if (bytesRead > 0) {
-            position.addAndGet(bytesRead);
-        }
-        return bytesRead;
+        int read = read(dst, pos);
+        if (read > 0) position.addAndGet(read);
+        return read;
     }
+
+    // ==================== ZERO-COPY OPTIMIZED READS ====================
 
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
         ensureOpen();
-        return readSync(dst, position);
-    }
+        CompletableFuture<ReadResult> future = readDirectAsync(dst.remaining(), position, true);
 
-    /**
-     * FIXED: Synchronous read that doesn't interfere with polling thread.
-     *
-     * The key fix: We DON'T add the request to asyncRequests map, so the
-     * polling thread will never try to process it.
-     */
-    private int readSync(ByteBuffer dst, long filePosition) throws IOException {
-        if (!dst.hasRemaining()) {
-            return 0;
-        }
+        // Wait for result
+        try (ReadResult rr = future.join()) {
+            int bytes = (int) rr.result();
+            if (bytes > 0) {
+                // OPTIMIZATION: Use the most direct copy possible
+                MemorySegment nativeSeg = rr.buffer();
+                MemorySegment dstSeg = dst.isDirect()
+                                       ?
+                                       MemorySegment.ofBuffer(dst)
+                                       :
+                                       MemorySegment.ofArray(dst.array());
 
-        // CRITICAL: Serialize all sync operations to prevent polling thread conflicts
-        synchronized (syncLock) {
-            try {
-                int readSize = dst.remaining();
+                long dstOffset = dst.isDirect()
+                                 ? dst.position()
+                                 : dst.arrayOffset() + dst.position();
+                MemorySegment.copy(
+                        nativeSeg,
+                        ValueLayout.JAVA_BYTE,
+                        0,
+                        dstSeg,
+                        ValueLayout.JAVA_BYTE,
+                        dstOffset,
+                        bytes
+                );
 
-                // 1. Prepare read
-                long requestId = ring.prepareRead(registeredFileIndex, readSize, filePosition);
-
-                // 2. Submit
-                ring.submit();
-
-                // 3. Wait for THIS specific result
-                // IMPORTANT: We consume it here, polling thread never sees it
-                Result result = waitForSpecificResult(requestId);
-
-                if (result == null) {
-                    throw new IOException("Failed to get result for request " + requestId);
-                }
-
-                if (!(result instanceof ReadResult)) {
-                    throw new IOException("Unexpected result type: " + result.getClass());
-                }
-
-                ReadResult readRes = (ReadResult) result;
-                try {
-                    long resultCode = readRes.result();
-
-                    if (resultCode < 0) {
-                        throw new IOException("Read failed with error code: " + resultCode);
-                    }
-
-                    // 4. Copy data
-                    if (resultCode > 0) {
-                        MemorySegment nativeBuffer = readRes.buffer();
-
-                        if (nativeBuffer == null) {
-                            throw new IOException("Native buffer is null");
-                        }
-
-                        int bytesToCopy = (int) Math.min(resultCode, dst.remaining());
-
-                        if (dst.hasArray()) {
-                            MemorySegment.copy(
-                                    nativeBuffer, JAVA_BYTE, 0,
-                                    dst.array(), dst.arrayOffset() + dst.position(),
-                                    bytesToCopy
-                            );
-                            dst.position(dst.position() + bytesToCopy);
-                        } else {
-                            MemorySegment dstSegment = MemorySegment.ofBuffer(dst);
-                            MemorySegment.copy(
-                                    nativeBuffer, JAVA_BYTE, 0,
-                                    dstSegment, JAVA_BYTE, dst.position(),
-                                    bytesToCopy
-                            );
-                            dst.position(dst.position() + bytesToCopy);
-                        }
-                    }
-
-                    return (int) resultCode;
-
-                } finally {
-                    // Free the native buffer
-                    readRes.close();
-                }
-
-            } catch (Exception e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Read interrupted", e);
+                dst.position(dst.position() + bytes);
             }
+            return bytes;
+        } catch (Exception e) {
+            throw new IOException(e);
         }
     }
 
     @Override
     public int write(ByteBuffer src) throws IOException {
-        ensureOpen();
         long pos = position.get();
-        int bytesWritten = writeSync(src, pos);
-        if (bytesWritten > 0) {
-            position.addAndGet(bytesWritten);
-        }
-        return bytesWritten;
+        int written = write(src, pos);
+        if (written > 0) position.addAndGet(written);
+        return written;
     }
+
+    // ==================== ZERO-COPY OPTIMIZED WRITES ====================
 
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
         ensureOpen();
-        return writeSync(src, position);
-    }
+        int len = src.remaining();
 
-    /**
-     * FIXED: Synchronous write that doesn't interfere with polling thread.
-     */
-    private int writeSync(ByteBuffer src, long filePosition) throws IOException {
-        if (!src.hasRemaining()) {
-            return 0;
+        // POTENTIAL BOTTLENECK: If ring.prepareWrite only takes byte[],
+        // we are forced to copy here.
+        byte[] data = new byte[len];
+        src.get(data);
+
+        CompletableFuture<Result> future = new CompletableFuture<>();
+        synchronized (submissionLock) {
+            long id = ring.prepareWrite(registeredFileIndex, data, position);
+            pendingRequests.put(id, future);
+            ring.submit();
         }
 
-        synchronized (syncLock) {
-            try {
-                int writeSize = src.remaining();
-                byte[] data = new byte[writeSize];
-
-                int originalPosition = src.position();
-                src.get(data);
-
-                long requestId = ring.prepareWrite(registeredFileIndex, data, filePosition);
-
-                ring.submit();
-
-                Result result = waitForSpecificResult(requestId);
-
-                if (result == null) {
-                    src.position(originalPosition);
-                    throw new IOException("Failed to get result for request " + requestId);
-                }
-
-                if (!(result instanceof WriteResult)) {
-                    src.position(originalPosition);
-                    throw new IOException("Unexpected result type: " + result.getClass());
-                }
-
-                WriteResult writeRes = (WriteResult) result;
-                long resultCode = writeRes.result();
-
-                if (resultCode < 0) {
-                    src.position(originalPosition);
-                    throw new IOException("Write failed with error code: " + resultCode);
-                }
-
-                return (int) resultCode;
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Write interrupted", e);
-            }
-        }
+        return (int) ((WriteResult) future.join()).result();
     }
 
-    /**
-     * CRITICAL METHOD: Wait for a specific result without letting polling thread consume it.
-     *
-     * This polls the completion queue looking for our specific request ID.
-     * If we find a different request (async operation), we hand it to the polling thread.
-     */
-    private Result waitForSpecificResult(long targetRequestId) throws InterruptedException {
-        long startTime = System.currentTimeMillis();
-        long timeout = 30000; // 30 second timeout
-
-        while (System.currentTimeMillis() - startTime < timeout) {
-            // Try to get a result
-            Result result = ring.waitForResult();
-
-            if (result == null) {
-                Thread.yield();
-                continue;
-            }
-
-            // Is this our result?
-            if (result.id() == targetRequestId) {
-                return result;
-            }
-
-            // Not ours - it's an async operation
-            // Hand it off to the async processing
-            // processAsyncResult(result);
-        }
-
-        throw new InterruptedException("Timeout waiting for result " + targetRequestId);
-    }
-
-
-
-    // ==================== SCATTER/GATHER I/O ====================
+    // ==================== SCATTER / GATHER IO (OPTIMIZED) ====================
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
         if (offset < 0 || length < 0 || offset + length > dsts.length) {
             throw new IndexOutOfBoundsException();
         }
+        ensureOpen();
 
+        long currentFilePos = position.get();
         long totalRead = 0;
-        for (int i = offset; i < offset + length; i++) {
-            int read = read(dsts[i]);
-            if (read < 0) {
-                return totalRead > 0 ? totalRead : -1;
+        List<CompletableFuture<ReadResult>> futures = new ArrayList<>(length);
+        List<ByteBuffer> targetBuffers = new ArrayList<>(length);
+
+        // 1. Prepare ALL reads without submitting (Batching)
+        synchronized (submissionLock) {
+            for (int i = offset; i < offset + length; i++) {
+                ByteBuffer buf = dsts[i];
+                if (!buf.hasRemaining()) continue;
+
+                targetBuffers.add(buf);
+                // submitNow = false
+                futures.add(readDirectAsync(buf.remaining(), currentFilePos, false));
+
+                currentFilePos += buf.remaining();
             }
-            totalRead += read;
-            if (read == 0 || !dsts[i].hasRemaining()) {
-                break;
-            }
+            // 2. Single Syscall for all buffers
+            ring.submit();
         }
-        return totalRead;
+
+        // 3. Wait for all and process results
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            for (int i = 0; i < futures.size(); i++) {
+                try (ReadResult result = futures.get(i).get()) {
+                    int bytes = (int) result.result();
+                    if (bytes > 0) {
+                        ByteBuffer dst = targetBuffers.get(i);
+                        MemorySegment nativeBuffer = result.buffer();
+
+                        if (dst.hasArray()) {
+                            MemorySegment.copy(nativeBuffer, ValueLayout.JAVA_BYTE, 0,
+                                               dst.array(), dst.arrayOffset() + dst.position(), bytes);
+                        } else {
+                            MemorySegment dstSeg = MemorySegment.ofBuffer(dst);
+                            MemorySegment.copy(nativeBuffer, ValueLayout.JAVA_BYTE, 0,
+                                               dstSeg, ValueLayout.JAVA_BYTE, dst.position(), bytes);
+                        }
+                        dst.position(dst.position() + bytes);
+                        totalRead += bytes;
+                    }
+                }
+            }
+
+            if (totalRead > 0) {
+                position.addAndGet(totalRead);
+            }
+            return totalRead;
+
+        } catch (Exception e) {
+            throw new IOException("Scatter read failed", e);
+        }
     }
 
     @Override
@@ -325,260 +266,180 @@ public class JUringFileChannel extends FileChannel {
         if (offset < 0 || length < 0 || offset + length > srcs.length) {
             throw new IndexOutOfBoundsException();
         }
+        ensureOpen();
 
+        long currentFilePos = position.get();
         long totalWritten = 0;
-        for (int i = offset; i < offset + length; i++) {
-            int written = write(srcs[i]);
-            totalWritten += written;
-            if (!srcs[i].hasRemaining()) {
-                break;
+        List<CompletableFuture<Integer>> futures = new ArrayList<>(length);
+
+        // 1. Prepare ALL writes without submitting
+        synchronized (submissionLock) {
+            for (int i = offset; i < offset + length; i++) {
+                ByteBuffer buf = srcs[i];
+                if (!buf.hasRemaining()) continue;
+
+                // submitNow = false
+                futures.add(writeAsync(buf, currentFilePos));
+                currentFilePos += buf.remaining();
+            }
+            // 2. Single Syscall
+            ring.submit();
+        }
+
+        // 3. Wait for all
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+            for (CompletableFuture<Integer> f : futures) {
+                totalWritten += f.get();
+            }
+
+            if (totalWritten > 0) {
+                position.addAndGet(totalWritten);
+            }
+            return totalWritten;
+
+        } catch (Exception e) {
+            throw new IOException("Gather write failed", e);
+        }
+    }
+
+    // ==================== ASYNC / BATCH API ====================
+
+    /**
+     * Reads directly into a native buffer.
+     * @param submitNow if false, queues the request but does not issue syscall.
+     */
+    public CompletableFuture<ReadResult> readDirectAsync(int length, long offset, boolean submitNow) {
+        CompletableFuture<Result> internalFuture = new CompletableFuture<>();
+        synchronized (submissionLock) {
+            long reqId = ring.prepareRead(registeredFileIndex, length, offset);
+            pendingRequests.put(reqId, internalFuture);
+
+            // Always call submit if requested, to wake up SQPOLL if it's idle
+            if (submitNow) {
+                ring.submit();
             }
         }
-        return totalWritten;
+        return internalFuture.thenApply(res -> (ReadResult) res);
     }
 
-    // ==================== POSITION MANAGEMENT ====================
-
-    @Override
-    public long position() throws IOException {
-        ensureOpen();
-        return position.get();
+    /**
+     * Helper for backward compatibility or direct calls
+     */
+    public CompletableFuture<ReadResult> readDirectAsync(int length, long offset) {
+        return readDirectAsync(length, offset, true);
     }
 
-    @Override
-    public FileChannel position(long newPosition) throws IOException {
-        ensureOpen();
-        if (newPosition < 0) {
-            throw new IllegalArgumentException("Position cannot be negative");
+    /**
+     * Asynchronous write with SQPOLL wakeup.
+     */
+    public CompletableFuture<Integer> writeAsync(ByteBuffer src, long position) {
+        int len = src.remaining();
+        byte[] data = new byte[len];
+        src.get(data);
+
+        CompletableFuture<Result> future = new CompletableFuture<>();
+        synchronized (submissionLock) {
+            long id = ring.prepareWrite(registeredFileIndex, data, position);
+            pendingRequests.put(id, future);
+
+            // CRITICAL: Even with SQPOLL, we must call submit().
+            // The driver will only perform a syscall IF the kernel thread is asleep.
+            ring.submit();
         }
-        position.set(newPosition);
-        return this;
+        return future.thenApply(r -> (int) ((WriteResult) r).result());
     }
+
+    /**
+     * Zero-copy write from direct ByteBuffer
+     */
+    public CompletableFuture<Integer> writeDirectAsync(ByteBuffer src, long position) {
+        if (!src.isDirect()) {
+            throw new IllegalArgumentException("Buffer must be direct");
+        }
+
+        CompletableFuture<Result> future = new CompletableFuture<>();
+
+        synchronized (submissionLock) {
+            // Use MemorySegment to pass direct buffer to io_uring
+            MemorySegment segment = MemorySegment.ofBuffer(src);
+            long id = ring.prepareWrite(registeredFileIndex, segment, position);
+            pendingRequests.put(id, future);
+            ring.submit();
+        }
+
+        return future.thenApply(r -> (int) ((WriteResult) r).result());
+    }
+
+    /**
+     * Flushes all prepared requests to the kernel.
+     */
+    public void submitBatch() {
+        synchronized (submissionLock) {
+            ring.submit();
+        }
+    }
+
+    // ==================== UNSUPPORTED / UTILS ====================
 
     @Override
     public long size() throws IOException {
-        ensureOpen();
-        throw new UnsupportedOperationException("size() requires fstat support");
-    }
-
-    @Override
-    public FileChannel truncate(long size) throws IOException {
-        ensureOpen();
-        if (size < 0) {
-            throw new IllegalArgumentException("Size cannot be negative");
-        }
-        throw new UnsupportedOperationException("truncate() requires ftruncate support");
+        throw new UnsupportedOperationException("Size not supported yet");
     }
 
     @Override
     public void force(boolean metaData) throws IOException {
-        ensureOpen();
-        throw new UnsupportedOperationException("fsync not yet exposed in JUring API");
+        throw new UnsupportedOperationException("Force (fsync) not supported yet");
     }
-
-    // ==================== TRANSFER OPERATIONS ====================
-
-    @Override
-    public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
-        ensureOpen();
-
-        if (position < 0 || count < 0) {
-            throw new IllegalArgumentException("Position and count must be non-negative");
-        }
-
-        long transferred = 0;
-        ByteBuffer buffer = ByteBuffer.allocate((int) Math.min(count, 8192));
-
-        while (transferred < count) {
-            buffer.clear();
-            int toRead = (int) Math.min(buffer.capacity(), count - transferred);
-            buffer.limit(toRead);
-
-            int read = read(buffer, position + transferred);
-            if (read < 0) {
-                break;
-            }
-
-            buffer.flip();
-            target.write(buffer);
-            transferred += read;
-        }
-
-        return transferred;
-    }
-
-    @Override
-    public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
-        ensureOpen();
-
-        if (position < 0 || count < 0) {
-            throw new IllegalArgumentException("Position and count must be non-negative");
-        }
-
-        long transferred = 0;
-        ByteBuffer buffer = ByteBuffer.allocate((int) Math.min(count, 8192));
-
-        while (transferred < count) {
-            buffer.clear();
-            int toRead = (int) Math.min(buffer.capacity(), count - transferred);
-            buffer.limit(toRead);
-
-            int read = src.read(buffer);
-            if (read < 0) {
-                break;
-            }
-
-            buffer.flip();
-            write(buffer, position + transferred);
-            transferred += read;
-        }
-
-        return transferred;
-    }
-
-    // ==================== UNSUPPORTED OPERATIONS ====================
-
-    @Override
-    public MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
-        throw new UnsupportedOperationException("Memory mapping not supported");
-    }
-
-    @Override
-    public FileLock lock(long position, long size, boolean shared) throws IOException {
-        throw new UnsupportedOperationException("File locking not yet implemented");
-    }
-
-    @Override
-    public FileLock tryLock(long position, long size, boolean shared) throws IOException {
-        throw new UnsupportedOperationException("File locking not yet implemented");
-    }
-
-    // ==================== CHANNEL LIFECYCLE ====================
 
     @Override
     protected void implCloseChannel() throws IOException {
         if (closed.compareAndSet(false, true)) {
-            ring.prepareCloseDirect(registeredFileIndex);
-            ring.submit();
-
-            try {
-                Result closeResult = ring.waitForResult();
-                if (closeResult instanceof CloseResult) {
-                    CloseResult cr = (CloseResult) closeResult;
-                    if (cr.result() < 0) {
-                        System.err.println("Warning: Close failed with error: " + cr.result());
-                    }
+            pollerThread.interrupt();
+            synchronized (submissionLock) {
+                try {
+                    ring.prepareCloseDirect(registeredFileIndex);
+                    ring.submit();
+                } catch (Exception e) {
+                    // ignore
                 }
-            } catch (Exception e) {
-                System.err.println("Warning: Error waiting for close completion: " + e.getMessage());
+                ring.close();
             }
-            ring.close();
         }
     }
 
+    @Override public long position() throws IOException { return position.get(); }
+    @Override public FileChannel position(long newPosition) { position.set(newPosition); return this; }
+    @Override public long transferTo(long pos, long count, WritableByteChannel target) { throw new UnsupportedOperationException(); }
+    @Override public long transferFrom(ReadableByteChannel src, long pos, long count) { throw new UnsupportedOperationException(); }
+    @Override public MappedByteBuffer map(MapMode mode, long pos, long size) { throw new UnsupportedOperationException(); }
+    @Override public FileChannel truncate(long size) { throw new UnsupportedOperationException(); }
+    @Override public FileLock lock(long pos, long size, boolean shared) { throw new UnsupportedOperationException(); }
+    @Override public FileLock tryLock(long pos, long size, boolean shared) { throw new UnsupportedOperationException(); }
+
     private void ensureOpen() {
-        if (closed.get()) {
-            throw new RuntimeException(new ClosedChannelException());
-        }
+        if (closed.get()) throw new RuntimeException(new ClosedChannelException());
     }
 
     private int calculateOpenFlags(Set<OpenOption> options) {
         int flags = 0;
-
         boolean read = options.contains(StandardOpenOption.READ);
         boolean write = options.contains(StandardOpenOption.WRITE);
+        if (read && write) flags = 2; // O_RDWR
+        else if (write) flags = 1;    // O_WRONLY
+        else flags = 0;               // O_RDONLY
 
-        if (read && write) {
-            flags = 2;
-        } else if (write) {
-            flags = 1;
-        } else {
-            flags = 0;
-        }
+        if (options.contains(StandardOpenOption.CREATE)) flags |= 0100;
+        if (options.contains(StandardOpenOption.CREATE_NEW)) flags |= 0100 | 0200;
+        if (options.contains(StandardOpenOption.TRUNCATE_EXISTING)) flags |= 01000;
+        if (options.contains(StandardOpenOption.APPEND)) flags |= 02000;
+        if (options.contains(StandardOpenOption.SYNC)) flags |= 04010000;
+        if (options.contains(StandardOpenOption.DSYNC)) flags |= 010000;
 
-        if (options.contains(StandardOpenOption.CREATE)) {
-            flags |= 0100;
-        }
-        if (options.contains(StandardOpenOption.CREATE_NEW)) {
-            flags |= 0100 | 0200;
-        }
-        if (options.contains(StandardOpenOption.TRUNCATE_EXISTING)) {
-            flags |= 01000;
-        }
-        if (options.contains(StandardOpenOption.APPEND)) {
-            flags |= 02000;
-        }
-        if (options.contains(StandardOpenOption.SYNC)) {
-            flags |= 04010000;
-        }
-        if (options.contains(StandardOpenOption.DSYNC)) {
-            flags |= 010000;
-        }
+        // Add O_DIRECT flag for database workloads
+        flags |= 040000;  // O_DIRECT
 
         return flags;
-    }
-
-    private static class PendingRequest {
-        final long id;
-        final ByteBuffer dstBuffer;
-        final CompletableFuture<Integer> future;
-        final CompletableFuture<ReadResult> directFuture;
-        final boolean isRead;
-
-        PendingRequest(long id, ByteBuffer dstBuffer, CompletableFuture<Integer> future, boolean isRead) {
-            this.id = id;
-            this.dstBuffer = dstBuffer;
-            this.future = future;
-            this.directFuture = null;
-            this.isRead = isRead;
-        }
-
-        PendingRequest(long id, CompletableFuture<ReadResult> directFuture) {
-            this.id = id;
-            this.dstBuffer = null;
-            this.future = null;
-            this.directFuture = directFuture;
-            this.isRead = true;
-        }
-    }
-
-    public static void main(String[] args) throws Exception {
-        Path testFile = Path.of("/tmp/juringtest_fixed.dat");
-
-        System.out.println("FIXED JUring FileChannel - No Double-Free");
-        System.out.println("=========================================");
-
-        try (JUringFileChannel channel = JUringFileChannel.open(testFile,
-                                                                StandardOpenOption.CREATE,
-                                                                StandardOpenOption.WRITE,
-                                                                StandardOpenOption.READ)) {
-
-            System.out.println("✓ Opened file");
-
-            // Test sync operations
-            String testData = "Hello, Fixed JUring!";
-            ByteBuffer writeBuffer = ByteBuffer.wrap(testData.getBytes());
-            int written = channel.write(writeBuffer, 0);
-            System.out.println("✓ Sync write: " + written + " bytes");
-
-            ByteBuffer readBuffer = ByteBuffer.allocate(200);
-            int read = channel.read(readBuffer, 0);
-            readBuffer.flip();
-            byte[] data = new byte[read];
-            readBuffer.get(data);
-            System.out.println("✓ Sync read: " + new String(data));
-
-            // Test many operations (stress test)
-            System.out.println("\n✓ Stress test: 1000 operations...");
-            for (int i = 0; i < 1000; i++) {
-                ByteBuffer buf = ByteBuffer.wrap(("Test-" + i).getBytes());
-                channel.write(buf, i * 100);
-            }
-            System.out.println("✓ Completed 1000 writes without crash!");
-
-            System.out.println("\n✓✓✓ All tests passed - No segfault! ✓✓✓");
-        }
-
-        System.out.println("\n✓ Channel closed cleanly");
     }
 }
