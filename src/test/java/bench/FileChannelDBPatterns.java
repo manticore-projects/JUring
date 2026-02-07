@@ -1,5 +1,6 @@
 package bench;
 
+import com.davidvlijmincx.lio.api.LinuxOpenOptions;
 import com.davidvlijmincx.lio.api.ReadResult;
 import com.davidvlijmincx.lio.channel.JUringFileChannel;
 import org.openjdk.jmh.annotations.*;
@@ -20,20 +21,21 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * CORRECTED Benchmark comparing JUring's async/batch APIs vs standard FileChannel.
- * 
- * Key changes:
+ *
+ * Key changes from original:
  * 1. Uses readDirectAsync() instead of blocking read()
  * 2. Uses direct ByteBuffers to avoid copies
  * 3. Uses scatter/gather APIs for batching
  * 4. Actually measures async benefits, not sync overhead
+ * 5. FIXED: Scatter/gather operations now set channel position correctly
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @State(Scope.Benchmark)
 @Warmup(iterations = 2, time = 2)
-@Measurement(iterations = 3, time = 3)
+@Measurement(iterations = 5, time = 5)
 @Fork(value = 1, jvmArgs = {"-Xms2g", "-Xmx2g"})
-public class DatabaseFileChannelBenchmarkCorrected {
+public class FileChannelDBPatterns {
 
     private static final int FILE_SIZE_MB = 100;
     private static final int PAGE_SIZE_4K = 4096;
@@ -56,13 +58,13 @@ public class DatabaseFileChannelBenchmarkCorrected {
 
         // Pre-populate file
         try (FileChannel channel = FileChannel.open(testFile,
-                StandardOpenOption.WRITE,
-                StandardOpenOption.CREATE,
-                StandardOpenOption.TRUNCATE_EXISTING)) {
+                                                    StandardOpenOption.WRITE,
+                                                    StandardOpenOption.CREATE,
+                                                    StandardOpenOption.TRUNCATE_EXISTING)) {
 
             ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024);
             Random random = new Random(42);
-            
+
             for (int i = 0; i < FILE_SIZE_MB; i++) {
                 buffer.clear();
                 while (buffer.hasRemaining()) {
@@ -85,12 +87,12 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Setup(Level.Iteration)
     public void setupIteration() throws IOException {
         standardChannel = FileChannel.open(testFile,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE);
+                                           StandardOpenOption.READ,
+                                           StandardOpenOption.WRITE);
 
         juringChannel = JUringFileChannel.open(testFile,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE);
+                                               LinuxOpenOptions.READ_DIRECT,
+                                               LinuxOpenOptions.WRITE_DIRECT);
     }
 
     @TearDown(Level.Iteration)
@@ -142,21 +144,21 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Benchmark
     public void randomRead_JUring_AsyncBatch(Blackhole bh) throws Exception {
         int totalOps = 100;
-        
+
         // Process in batches
         for (int batch = 0; batch < totalOps; batch += batchSize) {
             int currentBatchSize = Math.min(batchSize, totalOps - batch);
             List<CompletableFuture<ReadResult>> futures = new ArrayList<>(currentBatchSize);
-            
+
             // Submit all operations in batch WITHOUT waiting
             for (int i = 0; i < currentBatchSize; i++) {
                 long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
                 futures.add(juringChannel.readDirectAsync(pageSize, offset));
             }
-            
+
             // Wait once for entire batch
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            
+
             // Process results (zero-copy - direct native memory)
             for (CompletableFuture<ReadResult> future : futures) {
                 try (ReadResult result = future.get()) {
@@ -173,16 +175,16 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Benchmark
     public void randomRead_JUring_FullAsync(Blackhole bh) throws Exception {
         List<CompletableFuture<ReadResult>> futures = new ArrayList<>(100);
-        
+
         // Submit ALL 100 operations asynchronously
         for (int i = 0; i < 100; i++) {
             long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
             futures.add(juringChannel.readDirectAsync(pageSize, offset));
         }
-        
+
         // Single wait for all 100 operations
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        
+
         // Process all results
         for (CompletableFuture<ReadResult> future : futures) {
             try (ReadResult result = future.get()) {
@@ -194,20 +196,30 @@ public class DatabaseFileChannelBenchmarkCorrected {
     // ==================== RANDOM READ: SCATTER/GATHER API ====================
 
     /**
-     * Uses JUring's scatter/gather API - single syscall for multiple reads!
+     * FIXED: Uses JUring's scatter/gather API with correct position setting
+     * Single syscall for multiple reads!
      */
     @Benchmark
     public void randomRead_JUring_ScatterGather(Blackhole bh) throws IOException {
         int opsPerBatch = batchSize;
         ByteBuffer[] buffers = new ByteBuffer[opsPerBatch];
-        
+
         for (int i = 0; i < buffers.length; i++) {
             buffers[i] = ByteBuffer.allocateDirect(pageSize);
         }
-        
+
         // Read multiple buffers - batched submission internally
-        // Your implementation (lines 200-262) handles this efficiently
         for (int batch = 0; batch < 100 / opsPerBatch; batch++) {
+            // CRITICAL FIX: Set position before scatter read
+            // Scatter read uses channel's current position
+            long startOffset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
+            juringChannel.position(startOffset);
+
+            // Clear all buffers for reuse
+            for (ByteBuffer buf : buffers) {
+                buf.clear();
+            }
+
             long bytesRead = juringChannel.read(buffers, 0, opsPerBatch);
             bh.consume(bytesRead);
         }
@@ -218,11 +230,11 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Benchmark
     public void randomWrite_Standard_Sync(Blackhole bh) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
-        
+
         for (int i = 0; i < 100; i++) {
+            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
             buffer.clear();
             fillBufferDirect(buffer);
-            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
             int written = standardChannel.write(buffer, offset);
             bh.consume(written);
         }
@@ -231,58 +243,41 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Benchmark
     public void randomWrite_JUring_Sync(Blackhole bh) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
-        
+
         for (int i = 0; i < 100; i++) {
+            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
             buffer.clear();
             fillBufferDirect(buffer);
-            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
             int written = juringChannel.write(buffer, offset);
             bh.consume(written);
         }
     }
 
+    /**
+     * Async write - submit multiple, wait once
+     */
     @Benchmark
-    public void randomWrite_JUring_AsyncBatch(Blackhole bh) throws Exception {
-        int totalOps = 100;
-        
-        for (int batch = 0; batch < totalOps; batch += batchSize) {
-            int currentBatchSize = Math.min(batchSize, totalOps - batch);
-            List<CompletableFuture<Integer>> futures = new ArrayList<>(currentBatchSize);
-            
-            // Submit batch
-            for (int i = 0; i < currentBatchSize; i++) {
-                ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
-                fillBufferDirect(buffer);
-                long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
-                futures.add(juringChannel.writeAsync(buffer, offset));
-            }
-            
-            // Wait for batch
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            bh.consume(futures.size());
-        }
-    }
+    public void randomWrite_JUring_Async(Blackhole bh) throws Exception {
+        List<CompletableFuture<Integer>> futures = new ArrayList<>(100);
 
-    @Benchmark
-    public void randomWrite_JUring_ScatterGather(Blackhole bh) throws IOException {
-        int opsPerBatch = batchSize;
-        ByteBuffer[] buffers = new ByteBuffer[opsPerBatch];
-        
-        for (int i = 0; i < buffers.length; i++) {
-            buffers[i] = ByteBuffer.allocateDirect(pageSize);
-            fillBufferDirect(buffers[i]);
+        for (int i = 0; i < 100; i++) {
+            long offset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
+            ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
+            fillBufferDirect(buffer);
+            futures.add(juringChannel.writeAsync(buffer, offset));
         }
-        
-        for (int batch = 0; batch < 100 / opsPerBatch; batch++) {
-            long bytesWritten = juringChannel.write(buffers, 0, opsPerBatch);
-            bh.consume(bytesWritten);
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        for (CompletableFuture<Integer> future : futures) {
+            bh.consume(future.get());
         }
     }
 
     // ==================== SEQUENTIAL SCAN ====================
 
     @Benchmark
-    public void sequentialScan_Standard(Blackhole bh) throws IOException {
+    public void sequentialScan_Standard_Sync(Blackhole bh) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
         long position = 0;
         int pagesRead = 0;
@@ -320,23 +315,23 @@ public class DatabaseFileChannelBenchmarkCorrected {
     public void sequentialScan_JUring_AsyncBatch(Blackhole bh) throws Exception {
         long position = 0;
         int pagesRead = 0;
-        
+
         while (pagesRead < 1000) {
             List<CompletableFuture<ReadResult>> futures = new ArrayList<>(batchSize);
-            
+
             // Submit batch of sequential reads
             for (int i = 0; i < batchSize && pagesRead + i < 1000; i++) {
                 futures.add(juringChannel.readDirectAsync(pageSize, position + (i * pageSize)));
             }
-            
+
             CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-            
+
             for (CompletableFuture<ReadResult> future : futures) {
                 try (ReadResult result = future.get()) {
                     bh.consume(result.buffer().address());
                 }
             }
-            
+
             position += batchSize * pageSize;
             pagesRead += futures.size();
         }
@@ -348,7 +343,7 @@ public class DatabaseFileChannelBenchmarkCorrected {
     public void batchInsert_Standard(Blackhole bh) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
         long startOffset = ThreadLocalRandom.current().nextLong(0,
-                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
+                                                                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
 
         for (int i = 0; i < 100; i++) {
             buffer.clear();
@@ -362,7 +357,7 @@ public class DatabaseFileChannelBenchmarkCorrected {
     public void batchInsert_JUring_Sync(Blackhole bh) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
         long startOffset = ThreadLocalRandom.current().nextLong(0,
-                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
+                                                                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
 
         for (int i = 0; i < 100; i++) {
             buffer.clear();
@@ -378,45 +373,50 @@ public class DatabaseFileChannelBenchmarkCorrected {
     @Benchmark
     public void batchInsert_JUring_AsyncBatch(Blackhole bh) throws Exception {
         long startOffset = ThreadLocalRandom.current().nextLong(0,
-                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
-        
+                                                                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
+
         List<CompletableFuture<Integer>> futures = new ArrayList<>(100);
-        
+
         // Submit ALL 100 writes asynchronously
         for (int i = 0; i < 100; i++) {
             ByteBuffer buffer = ByteBuffer.allocateDirect(pageSize);
             fillBufferDirect(buffer);
             futures.add(juringChannel.writeAsync(buffer, startOffset + (i * pageSize)));
         }
-        
+
         // Single wait
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
         bh.consume(futures.size());
     }
 
+    /**
+     * FIXED: Batch insert with scatter/gather - sets position correctly
+     */
     @Benchmark
     public void batchInsert_JUring_ScatterGather(Blackhole bh) throws IOException {
         long startOffset = ThreadLocalRandom.current().nextLong(0,
-                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
-        
+                                                                FILE_SIZE_MB * 1024 * 1024 - (100 * pageSize));
+
         // Use scatter/gather for maximum efficiency
         int opsPerBatch = 16;
         ByteBuffer[] buffers = new ByteBuffer[opsPerBatch];
-        
+
         for (int i = 0; i < buffers.length; i++) {
             buffers[i] = ByteBuffer.allocateDirect(pageSize);
-            fillBufferDirect(buffers[i]);
         }
-        
+
         for (int batch = 0; batch < 100 / opsPerBatch; batch++) {
-            long written = juringChannel.write(buffers, 0, opsPerBatch);
-            bh.consume(written);
-            
-            // Reset buffers for next batch
+            // CRITICAL FIX: Set channel position before gather write
+            juringChannel.position(startOffset + (batch * opsPerBatch * pageSize));
+
+            // Fill buffers
             for (ByteBuffer buf : buffers) {
                 buf.clear();
                 fillBufferDirect(buf);
             }
+
+            long written = juringChannel.write(buffers, 0, opsPerBatch);
+            bh.consume(written);
         }
     }
 
@@ -488,7 +488,7 @@ public class DatabaseFileChannelBenchmarkCorrected {
 
         // Wait once for all operations
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-        
+
         // Consume read results
         for (CompletableFuture<?> future : futures) {
             Object result = future.get();

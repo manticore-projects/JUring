@@ -24,10 +24,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class JUringFileChannel extends FileChannel {
 
-    private static final int DEFAULT_QUEUE_DEPTH = 512;
+    private static final int DEFAULT_QUEUE_DEPTH = 1024;
     private static final int BATCH_SIZE = 64;
 
-    private final Path path;
     private JUring ring;
     private final int registeredFileIndex;
     private final AtomicLong position = new AtomicLong(0);
@@ -46,33 +45,61 @@ public class JUringFileChannel extends FileChannel {
         return new JUringFileChannel(path, new HashSet<>(Arrays.asList(options)));
     }
 
+    /*
+    Flag	Recommended?	Impact
+    SQPOLL	Yes	Zero-syscall I/O. Use for high-frequency writes (WAL).
+    IOPOLL	Yes	Lowest possible latency for NVMe storage.
+    DEFER_TASKRUN	Yes	Best performance on modern (5.19+) kernels.
+    SINGLE_ISSUER	Highly	Essential for Thread-per-Core architectures.
+    COOP_TASKRUN	Yes	General efficiency boost for task processing.
+    NO_SQARRAY	Yes	Removes a layer of memory indirection.
+
+    Flag	Use for Database?	Why?
+    IOSQE_FIXED_FILE	Yes	Minimizes per-I/O overhead by using registered file descriptors.
+    IOSQE_IO_LINK	Yes	Ensures Write-Ahead Log (WAL) durability sequences are ordered.
+    IOSQE_BUFFER_SELECT	No	Typically used for network sockets; databases manage their own byte buffers.
+    IOSQE_IO_DRAIN	No	Too heavy; it stops all new I/O until all previous I/O finishes. Use Links instead.
+    IOSQE_ASYNC	Rarely	Only if your submission thread is experiencing latency spikes.
+     */
     private JUringFileChannel(Path path, Set<OpenOption> options) throws IOException {
-        this.path = path;
         try {
-            this.ring = new JUring(DEFAULT_QUEUE_DEPTH, IoUringOptions.IORING_SETUP_SQPOLL);
+            this.ring = new JUring(DEFAULT_QUEUE_DEPTH
+                    , IoUringOptions.IORING_SETUP_SQPOLL
+//                    , IoUringOptions.IORING_SETUP_IOPOLL <-- error
 
-            // 1. Open the file
-            int flags = calculateOpenFlags(options);
-            int mode = 0644;
-            long openReqId = ring.prepareOpen(path.toString(), flags, mode);
-            ring.submit();
-            Result openResult = ring.waitForResult(); // Blocking init is fine
+                    , IoUringOptions.IORING_SETUP_COOP_TASKRUN
+                    , IoUringOptions.IORING_SETUP_SINGLE_ISSUER
+                    , IoUringOptions.IORING_SETUP_DEFER_TASKRUN
+                    , IoUringOptions.IORING_SETUP_NO_SQARRAY
+            );
 
-            if (!(openResult instanceof OpenResult)) {
-                throw new IOException("Failed to open file: Unexpected result");
-            }
-
-            FileDescriptor fd = ((OpenResult) openResult).fileDescriptor();
-            if (fd.getFd() < 0) {
-                throw new IOException("Failed to open file: " + path);
-            }
-
-            // 2. Register file for performance
+            FileDescriptor fd = new FileDescriptor(path.toString(), LinuxOpenOptions.READ_WRITE_DIRECT , 0644);
             int regRes = ring.registerFiles(fd);
             if (regRes < 0) {
                 throw new IOException("Failed to register file");
             }
             this.registeredFileIndex = 0;
+
+            // 1. Open the file
+            int flags = calculateOpenFlags(options);
+            int mode = 0644;
+            long openReqId = ring.prepareOpenDirect(path.toString()
+                    , flags
+                    , mode
+                    , 0
+                    , SqeOptions.IOSQE_FIXED_FILE
+                    , SqeOptions.IOSQE_IO_LINK
+            );
+            ring.submit();
+            Result openResult = ring.waitForResult(); // Blocking init is fine
+
+            if (!(openResult instanceof OpenResult or)) {
+                throw new IOException("Failed to open file: Unexpected result");
+            }
+
+            if (or.id()!=openReqId) {
+                throw new IOException("Failed to open file: error code ");
+            }
 
             // 3. Start the Poller Thread
             this.pollerThread = new Thread(this::pollLoop, "juring-poller");
@@ -131,32 +158,37 @@ public class JUringFileChannel extends FileChannel {
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
         ensureOpen();
+
+        // Special case: zero-length buffer should return 0, not perform I/O
+        if (!dst.hasRemaining()) {
+            return 0;
+        }
+
         CompletableFuture<ReadResult> future = readDirectAsync(dst.remaining(), position, true);
 
         // Wait for result
         try (ReadResult rr = future.join()) {
             int bytes = (int) rr.result();
-            if (bytes > 0) {
-                // OPTIMIZATION: Use the most direct copy possible
-                MemorySegment nativeSeg = rr.buffer();
-                MemorySegment dstSeg = dst.isDirect()
-                                       ?
-                                       MemorySegment.ofBuffer(dst)
-                                       :
-                                       MemorySegment.ofArray(dst.array());
+            // Handle EOF: if we read 0 bytes, return -1 per FileChannel contract
+            if (bytes == 0) {
+                return -1;
+            }
 
-                long dstOffset = dst.isDirect()
-                                 ? dst.position()
-                                 : dst.arrayOffset() + dst.position();
-                MemorySegment.copy(
-                        nativeSeg,
-                        ValueLayout.JAVA_BYTE,
-                        0,
-                        dstSeg,
-                        ValueLayout.JAVA_BYTE,
-                        dstOffset,
-                        bytes
-                );
+            if (bytes > 0) {
+                // OPTIMIZATION: Use sliced segments for more efficient bulk copy
+                MemorySegment srcSeg = rr.buffer().asSlice(0, bytes);
+
+                if (dst.isDirect()) {
+                    // Direct buffer: slice and use copyFrom (potentially zero-copy on same memory space)
+                    MemorySegment dstSeg = MemorySegment.ofBuffer(dst)
+                                                        .asSlice(dst.position(), bytes);
+                    dstSeg.copyFrom(srcSeg);
+                } else {
+                    // Heap buffer: use array-based segment
+                    MemorySegment dstSeg = MemorySegment.ofArray(dst.array())
+                                                        .asSlice(dst.arrayOffset() + dst.position(), bytes);
+                    dstSeg.copyFrom(srcSeg);
+                }
 
                 dst.position(dst.position() + bytes);
             }
@@ -180,20 +212,14 @@ public class JUringFileChannel extends FileChannel {
     public int write(ByteBuffer src, long position) throws IOException {
         ensureOpen();
         int len = src.remaining();
+        if (len == 0) return 0;
 
-        // POTENTIAL BOTTLENECK: If ring.prepareWrite only takes byte[],
-        // we are forced to copy here.
-        byte[] data = new byte[len];
-        src.get(data);
-
-        CompletableFuture<Result> future = new CompletableFuture<>();
-        synchronized (submissionLock) {
-            long id = ring.prepareWrite(registeredFileIndex, data, position);
-            pendingRequests.put(id, future);
-            ring.submit();
+        CompletableFuture<Integer> future = writeAsync(src, position);
+        try {
+            return future.join();
+        } catch (Exception e) {
+            throw new IOException(e);
         }
-
-        return (int) ((WriteResult) future.join()).result();
     }
 
     // ==================== SCATTER / GATHER IO (OPTIMIZED) ====================
@@ -278,11 +304,13 @@ public class JUringFileChannel extends FileChannel {
                 ByteBuffer buf = srcs[i];
                 if (!buf.hasRemaining()) continue;
 
-                // submitNow = false
-                futures.add(writeAsync(buf, currentFilePos));
-                currentFilePos += buf.remaining();
+                // CRITICAL: Capture size BEFORE writeAsync consumes the buffer
+                int bufSize = buf.remaining();
+                // Use submitNow=false to batch all writes
+                futures.add(writeAsync(buf, currentFilePos, false));
+                currentFilePos += bufSize;
             }
-            // 2. Single Syscall
+            // 2. Single Syscall for all writes
             ring.submit();
         }
 
@@ -331,45 +359,52 @@ public class JUringFileChannel extends FileChannel {
         return readDirectAsync(length, offset, true);
     }
 
+
     /**
      * Asynchronous write with SQPOLL wakeup.
+     * @param submitNow if false, queues the request but does not issue syscall (for batching)
      */
-    public CompletableFuture<Integer> writeAsync(ByteBuffer src, long position) {
-        int len = src.remaining();
-        byte[] data = new byte[len];
-        src.get(data);
-
+    public CompletableFuture<Integer> writeAsync(ByteBuffer src, long position, boolean submitNow) {
         CompletableFuture<Result> future = new CompletableFuture<>();
         synchronized (submissionLock) {
-            long id = ring.prepareWrite(registeredFileIndex, data, position);
+            long id;
+            int len = src.remaining();
+
+            if (src.isDirect()) {
+                // Zero-copy write from direct ByteBuffer
+                MemorySegment segment = MemorySegment.ofBuffer(src);
+                id = ring.prepareWrite(registeredFileIndex, segment, position);
+                // Advance the position manually since MemorySegment doesn't consume it
+                src.position(src.position() + len);
+            } else {
+                // For heap buffers, copy data without modifying buffer position yet
+                byte[] data = new byte[len];
+
+                // Use duplicate to read data without consuming original buffer
+                ByteBuffer temp = src.duplicate();
+                temp.get(data);
+
+                // Now advance the original buffer's position to match FileChannel contract
+                src.position(src.position() + len);
+
+                id = ring.prepareWrite(registeredFileIndex, data, position);
+            }
             pendingRequests.put(id, future);
 
             // CRITICAL: Even with SQPOLL, we must call submit().
             // The driver will only perform a syscall IF the kernel thread is asleep.
-            ring.submit();
+            if (submitNow) {
+                ring.submit();
+            }
         }
         return future.thenApply(r -> (int) ((WriteResult) r).result());
     }
 
     /**
-     * Zero-copy write from direct ByteBuffer
+     * Asynchronous write with immediate submission (backward compatibility)
      */
-    public CompletableFuture<Integer> writeDirectAsync(ByteBuffer src, long position) {
-        if (!src.isDirect()) {
-            throw new IllegalArgumentException("Buffer must be direct");
-        }
-
-        CompletableFuture<Result> future = new CompletableFuture<>();
-
-        synchronized (submissionLock) {
-            // Use MemorySegment to pass direct buffer to io_uring
-            MemorySegment segment = MemorySegment.ofBuffer(src);
-            long id = ring.prepareWrite(registeredFileIndex, segment, position);
-            pendingRequests.put(id, future);
-            ring.submit();
-        }
-
-        return future.thenApply(r -> (int) ((WriteResult) r).result());
+    public CompletableFuture<Integer> writeAsync(ByteBuffer src, long position) {
+        return writeAsync(src, position, true);
     }
 
     /**
@@ -409,7 +444,7 @@ public class JUringFileChannel extends FileChannel {
         }
     }
 
-    @Override public long position() throws IOException { return position.get(); }
+    @Override public long position() { return position.get(); }
     @Override public FileChannel position(long newPosition) { position.set(newPosition); return this; }
     @Override public long transferTo(long pos, long count, WritableByteChannel target) { throw new UnsupportedOperationException(); }
     @Override public long transferFrom(ReadableByteChannel src, long pos, long count) { throw new UnsupportedOperationException(); }
