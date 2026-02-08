@@ -1,6 +1,7 @@
 package com.davidvlijmincx.lio.channel;
 
 import com.davidvlijmincx.lio.api.*;
+
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -16,16 +17,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * High-Performance JUring FileChannel.
- * * Key Architecture:
- * 1. Poller Thread: A dedicated daemon thread waits for CQEs (Completion Queue Events).
- * 2. Async Submission: Requests are submitted non-blockingly.
- * 3. Batching: Scatter/Gather and Batch operations use a single syscall for multiple buffers.
+ * High-Performance JUring FileChannel with Enhanced Lock-Free Architecture
+ *
+ * Key Features:
+ * 1. Batched submission queue to reduce lock contention
+ * 2. Background submission thread for automatic batching
+ * 3. Lock-free operation queuing for write-heavy workloads
+ * 4. All correctness fixes applied (EOF handling, buffer state management)
+ *
+ * Architecture:
+ * - Poller Thread: Consumes completion events (CQEs)
+ * - Batch Submitter Thread: Processes queued operations in batches
+ * - Main Threads: Queue operations lock-free, minimal synchronization
  */
 public class JUringFileChannel extends FileChannel {
 
     private static final int DEFAULT_QUEUE_DEPTH = 1024;
     private static final int BATCH_SIZE = 64;
+    private static final int SUBMISSION_BATCH_THRESHOLD = 8; // Auto-submit when queue reaches this size
 
     private JUring ring;
     private final int registeredFileIndex;
@@ -35,32 +44,25 @@ public class JUringFileChannel extends FileChannel {
     // Maps Request ID -> The Future waiting for that result
     private final ConcurrentHashMap<Long, CompletableFuture<Result>> pendingRequests = new ConcurrentHashMap<>();
 
+    // OPTIMIZATION: Batched Submission Queue (reduces lock contention)
+    private final ConcurrentLinkedQueue<PendingOperation> submissionQueue = new ConcurrentLinkedQueue<>();
+    private final AtomicLong queuedOperations = new AtomicLong(0);
+
     // Lock ONLY for the submission ring (very fast, no I/O blocking)
     private final Object submissionLock = new Object();
 
-    // The thread that processes all completions
+    // The threads that process completions and submissions
     private final Thread pollerThread;
+    private final Thread batchSubmitterThread;
+
+    // Metrics for profiling
+    private final AtomicLong lockContentionCount = new AtomicLong(0);
+    private final AtomicLong batchSubmissionCount = new AtomicLong(0);
 
     public static JUringFileChannel open(Path path, OpenOption... options) throws IOException {
         return new JUringFileChannel(path, new HashSet<>(Arrays.asList(options)));
     }
 
-    /*
-    Flag	Recommended?	Impact
-    SQPOLL	Yes	Zero-syscall I/O. Use for high-frequency writes (WAL).
-    IOPOLL	Yes	Lowest possible latency for NVMe storage.
-    DEFER_TASKRUN	Yes	Best performance on modern (5.19+) kernels.
-    SINGLE_ISSUER	Highly	Essential for Thread-per-Core architectures.
-    COOP_TASKRUN	Yes	General efficiency boost for task processing.
-    NO_SQARRAY	Yes	Removes a layer of memory indirection.
-
-    Flag	Use for Database?	Why?
-    IOSQE_FIXED_FILE	Yes	Minimizes per-I/O overhead by using registered file descriptors.
-    IOSQE_IO_LINK	Yes	Ensures Write-Ahead Log (WAL) durability sequences are ordered.
-    IOSQE_BUFFER_SELECT	No	Typically used for network sockets; databases manage their own byte buffers.
-    IOSQE_IO_DRAIN	No	Too heavy; it stops all new I/O until all previous I/O finishes. Use Links instead.
-    IOSQE_ASYNC	Rarely	Only if your submission thread is experiencing latency spikes.
-     */
     private JUringFileChannel(Path path, Set<OpenOption> options) throws IOException {
         try {
             this.ring = new JUring(DEFAULT_QUEUE_DEPTH
@@ -97,8 +99,8 @@ public class JUringFileChannel extends FileChannel {
                 throw new IOException("Failed to open file: Unexpected result");
             }
 
-            if (or.id()!=openReqId) {
-                throw new IOException("Failed to open file: error code ");
+            if (or.id() != openReqId) {
+                throw new IOException("Failed to open file: wrong request ID");
             }
 
             // 3. Start the Poller Thread
@@ -106,10 +108,77 @@ public class JUringFileChannel extends FileChannel {
             this.pollerThread.setDaemon(true);
             this.pollerThread.start();
 
+            // 4. Start the Batch Submitter Thread
+            this.batchSubmitterThread = new Thread(this::batchSubmissionLoop, "juring-batch-submitter");
+            this.batchSubmitterThread.setDaemon(true);
+            this.batchSubmitterThread.start();
+
         } catch (Exception e) {
             if (ring != null) try { ring.close(); } catch (Exception ignored) {}
             throw new IOException("Failed to initialize JUringFileChannel", e);
         }
+    }
+
+    /**
+     * Background thread that batches submissions to reduce lock contention
+     */
+    private void batchSubmissionLoop() {
+        while (!closed.get()) {
+            try {
+                long queued = queuedOperations.get();
+
+                if (queued >= SUBMISSION_BATCH_THRESHOLD) {
+                    // Time to submit batch
+                    flushSubmissionQueue();
+                    batchSubmissionCount.incrementAndGet();
+                } else if (queued > 0) {
+                    // Check every 100μs if there are pending operations
+                    Thread.sleep(0, 100_000); // 100 microseconds
+                } else {
+                    // No pending operations, sleep longer
+                    Thread.sleep(1);
+                }
+            } catch (InterruptedException e) {
+                if (!closed.get()) {
+                    Thread.currentThread().interrupt();
+                }
+            } catch (Exception e) {
+                if (!closed.get()) {
+                    e.printStackTrace();
+                }
+            }
+        }
+    }
+
+    /**
+     * Flush all queued operations to the ring (single lock acquisition for batch)
+     */
+    private void flushSubmissionQueue() {
+        if (submissionQueue.isEmpty()) {
+            return;
+        }
+
+        List<PendingOperation> batch = new ArrayList<>();
+        PendingOperation op;
+
+        // Drain queue (lock-free)
+        while ((op = submissionQueue.poll()) != null) {
+            batch.add(op);
+        }
+
+        if (batch.isEmpty()) {
+            return;
+        }
+
+        // Submit all at once with single lock acquisition
+        synchronized (submissionLock) {
+            for (PendingOperation operation : batch) {
+                operation.submit();
+            }
+            ring.submit();
+        }
+
+        queuedOperations.addAndGet(-batch.size());
     }
 
     /**
@@ -169,7 +238,8 @@ public class JUringFileChannel extends FileChannel {
         // Wait for result
         try (ReadResult rr = future.join()) {
             int bytes = (int) rr.result();
-            // Handle EOF: if we read 0 bytes, return -1 per FileChannel contract
+
+            // Handle EOF: if we read 0 bytes from a non-empty buffer, return -1 per FileChannel contract
             if (bytes == 0) {
                 return -1;
             }
@@ -191,7 +261,10 @@ public class JUringFileChannel extends FileChannel {
                 }
 
                 dst.position(dst.position() + bytes);
+                return bytes;
             }
+
+            // Negative result indicates an error
             return bytes;
         } catch (Exception e) {
             throw new IOException(e);
@@ -222,7 +295,7 @@ public class JUringFileChannel extends FileChannel {
         }
     }
 
-    // ==================== SCATTER / GATHER IO (OPTIMIZED) ====================
+    // ==================== SCATTER/GATHER OPERATIONS ====================
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
@@ -236,8 +309,10 @@ public class JUringFileChannel extends FileChannel {
         List<CompletableFuture<ReadResult>> futures = new ArrayList<>(length);
         List<ByteBuffer> targetBuffers = new ArrayList<>(length);
 
-        // 1. Prepare ALL reads without submitting (Batching)
+        // 1. Prepare ALL reads without submitting
         synchronized (submissionLock) {
+            lockContentionCount.incrementAndGet();
+
             for (int i = offset; i < offset + length; i++) {
                 ByteBuffer buf = dsts[i];
                 if (!buf.hasRemaining()) continue;
@@ -245,10 +320,9 @@ public class JUringFileChannel extends FileChannel {
                 targetBuffers.add(buf);
                 // submitNow = false
                 futures.add(readDirectAsync(buf.remaining(), currentFilePos, false));
-
                 currentFilePos += buf.remaining();
             }
-            // 2. Single Syscall for all buffers
+            // 2. Single Syscall
             ring.submit();
         }
 
@@ -298,21 +372,20 @@ public class JUringFileChannel extends FileChannel {
         long totalWritten = 0;
         List<CompletableFuture<Integer>> futures = new ArrayList<>(length);
 
-        // 1. Prepare ALL writes without submitting
-        synchronized (submissionLock) {
-            for (int i = offset; i < offset + length; i++) {
-                ByteBuffer buf = srcs[i];
-                if (!buf.hasRemaining()) continue;
+        // 1. Prepare ALL writes using batched submission (reduces lock contention)
+        for (int i = offset; i < offset + length; i++) {
+            ByteBuffer buf = srcs[i];
+            if (!buf.hasRemaining()) continue;
 
-                // CRITICAL: Capture size BEFORE writeAsync consumes the buffer
-                int bufSize = buf.remaining();
-                // Use submitNow=false to batch all writes
-                futures.add(writeAsync(buf, currentFilePos, false));
-                currentFilePos += bufSize;
-            }
-            // 2. Single Syscall for all writes
-            ring.submit();
+            // CRITICAL: Capture size BEFORE writeAsync consumes the buffer
+            int bufSize = buf.remaining();
+            // Use batched async to reduce lock contention
+            futures.add(writeAsyncBatched(buf, currentFilePos));
+            currentFilePos += bufSize;
         }
+
+        // 2. Flush the submission queue to ensure all writes are submitted
+        flushSubmissionQueue();
 
         // 3. Wait for all
         try {
@@ -341,7 +414,11 @@ public class JUringFileChannel extends FileChannel {
     public CompletableFuture<ReadResult> readDirectAsync(int length, long offset, boolean submitNow) {
         CompletableFuture<Result> internalFuture = new CompletableFuture<>();
         synchronized (submissionLock) {
-            long reqId = ring.prepareRead(registeredFileIndex, length, offset);
+            lockContentionCount.incrementAndGet();
+
+            long reqId = submitNow
+                         ? ring.prepareRead(registeredFileIndex, length, offset)
+                         : ring.prepareRead(registeredFileIndex, length, offset, SqeOptions.IOSQE_IO_LINK);
             pendingRequests.put(reqId, internalFuture);
 
             // Always call submit if requested, to wake up SQPOLL if it's idle
@@ -359,7 +436,6 @@ public class JUringFileChannel extends FileChannel {
         return readDirectAsync(length, offset, true);
     }
 
-
     /**
      * Asynchronous write with SQPOLL wakeup.
      * @param submitNow if false, queues the request but does not issue syscall (for batching)
@@ -367,13 +443,17 @@ public class JUringFileChannel extends FileChannel {
     public CompletableFuture<Integer> writeAsync(ByteBuffer src, long position, boolean submitNow) {
         CompletableFuture<Result> future = new CompletableFuture<>();
         synchronized (submissionLock) {
+            lockContentionCount.incrementAndGet();
+
             long id;
             int len = src.remaining();
 
             if (src.isDirect()) {
                 // Zero-copy write from direct ByteBuffer
                 MemorySegment segment = MemorySegment.ofBuffer(src);
-                id = ring.prepareWrite(registeredFileIndex, segment, position);
+                id = submitNow
+                    ? ring.prepareWrite(registeredFileIndex, segment, position)
+                    : ring.prepareWrite(registeredFileIndex, segment, position, SqeOptions.IOSQE_IO_LINK);
                 // Advance the position manually since MemorySegment doesn't consume it
                 src.position(src.position() + len);
             } else {
@@ -387,7 +467,9 @@ public class JUringFileChannel extends FileChannel {
                 // Now advance the original buffer's position to match FileChannel contract
                 src.position(src.position() + len);
 
-                id = ring.prepareWrite(registeredFileIndex, data, position);
+                id = submitNow
+                    ? ring.prepareWrite(registeredFileIndex, data, position)
+                    : ring.prepareWrite(registeredFileIndex, data, position, SqeOptions.IOSQE_IO_LINK);
             }
             pendingRequests.put(id, future);
 
@@ -408,12 +490,76 @@ public class JUringFileChannel extends FileChannel {
     }
 
     /**
+     * BATCHED async write - queues operation for batched submission to reduce lock contention.
+     * This is the preferred method for gather writes and high-throughput scenarios.
+     */
+    public CompletableFuture<Integer> writeAsyncBatched(ByteBuffer src, long position) {
+        ensureOpen();
+
+        int len = src.remaining();
+        CompletableFuture<Result> internalFuture = new CompletableFuture<>();
+
+        // Prepare data outside the queue
+        final byte[] data;
+        if (src.isDirect()) {
+            // For direct buffers, copy via MemorySegment
+            data = new byte[len];
+            MemorySegment segment = MemorySegment.ofBuffer(src);
+            MemorySegment.copy(segment, ValueLayout.JAVA_BYTE, src.position(),
+                               data, 0, len);
+            src.position(src.position() + len);
+        } else {
+            // For heap buffers, use duplicate
+            data = new byte[len];
+            ByteBuffer temp = src.duplicate();
+            temp.get(data);
+            src.position(src.position() + len);
+        }
+
+        // Queue the operation (lock-free)
+        PendingOperation op = new PendingOperation() {
+            @Override
+            public void submit() {
+                long id = ring.prepareWrite(registeredFileIndex, data, position);
+                pendingRequests.put(id, internalFuture);
+            }
+        };
+
+        submissionQueue.offer(op);
+        queuedOperations.incrementAndGet();
+
+        // Trigger immediate submission if queue is large enough
+        if (queuedOperations.get() >= SUBMISSION_BATCH_THRESHOLD) {
+            flushSubmissionQueue();
+        }
+
+        return internalFuture.thenApply(r -> (int) ((WriteResult) r).result());
+    }
+
+    /**
      * Flushes all prepared requests to the kernel.
      */
     public void submitBatch() {
-        synchronized (submissionLock) {
-            ring.submit();
-        }
+        flushSubmissionQueue();
+    }
+
+    // ==================== PROFILING / METRICS ====================
+
+    /**
+     * Get metrics for profiling lock contention
+     */
+    public PerformanceMetrics getMetrics() {
+        return new PerformanceMetrics(
+                lockContentionCount.get(),
+                batchSubmissionCount.get(),
+                queuedOperations.get(),
+                pendingRequests.size()
+        );
+    }
+
+    public void resetMetrics() {
+        lockContentionCount.set(0);
+        batchSubmissionCount.set(0);
     }
 
     // ==================== UNSUPPORTED / UTILS ====================
@@ -431,8 +577,14 @@ public class JUringFileChannel extends FileChannel {
     @Override
     protected void implCloseChannel() throws IOException {
         if (closed.compareAndSet(false, true)) {
+            // Flush any pending operations
+            flushSubmissionQueue();
+
             pollerThread.interrupt();
+            batchSubmitterThread.interrupt();
+
             synchronized (submissionLock) {
+                lockContentionCount.incrementAndGet();
                 try {
                     ring.prepareCloseDirect(registeredFileIndex);
                     ring.submit();
@@ -472,9 +624,36 @@ public class JUringFileChannel extends FileChannel {
         if (options.contains(StandardOpenOption.SYNC)) flags |= 04010000;
         if (options.contains(StandardOpenOption.DSYNC)) flags |= 010000;
 
-        // Add O_DIRECT flag for database workloads
-        flags |= 040000;  // O_DIRECT
-
         return flags;
+    }
+
+    // ==================== HELPER CLASSES ====================
+
+    /**
+     * Represents a pending I/O operation that can be submitted later
+     */
+    private interface PendingOperation {
+        void submit();
+    }
+
+    public static class PerformanceMetrics {
+        public final long lockAcquisitions;
+        public final long batchSubmissions;
+        public final long queuedOperations;
+        public final int pendingRequests;
+
+        public PerformanceMetrics(long lockAcquisitions, long batchSubmissions,
+                                  long queuedOperations, int pendingRequests) {
+            this.lockAcquisitions = lockAcquisitions;
+            this.batchSubmissions = batchSubmissions;
+            this.queuedOperations = queuedOperations;
+            this.pendingRequests = pendingRequests;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Metrics[locks=%d, batches=%d, queued=%d, pending=%d]",
+                                 lockAcquisitions, batchSubmissions, queuedOperations, pendingRequests);
+        }
     }
 }

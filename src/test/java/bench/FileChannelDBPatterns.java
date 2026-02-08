@@ -274,6 +274,41 @@ public class FileChannelDBPatterns {
         }
     }
 
+    /**
+     * Random write using scatter/gather API
+     * Note: Since scatter/gather writes contiguously from position,
+     * we perform multiple smaller scatter operations at random offsets
+     */
+    @Benchmark
+    public void randomWrite_JUring_ScatterGather(Blackhole bh) throws IOException {
+        int buffersPerOperation = 4; // Smaller batches for random access
+        ByteBuffer[] buffers = new ByteBuffer[buffersPerOperation];
+
+        for (int i = 0; i < buffers.length; i++) {
+            buffers[i] = ByteBuffer.allocateDirect(pageSize);
+        }
+
+        // Perform 25 scatter write operations (25 * 4 = 100 total writes)
+        for (int op = 0; op < 25; op++) {
+            // Pick a random starting offset for this batch
+            long baseOffset = randomOffsets.get(ThreadLocalRandom.current().nextInt(randomOffsets.size()));
+
+            // Set position for scatter write
+            juringChannel.position(baseOffset);
+
+            // Fill all buffers with data
+            for (ByteBuffer buf : buffers) {
+                buf.clear();
+                fillBufferDirect(buf);
+            }
+
+            // Write all buffers starting from the random position
+            // This will write buffersPerOperation pages contiguously from baseOffset
+            long written = juringChannel.write(buffers, 0, buffersPerOperation);
+            bh.consume(written);
+        }
+    }
+
     // ==================== SEQUENTIAL SCAN ====================
 
     @Benchmark

@@ -72,7 +72,7 @@ public class LockContentionTest {
     }
     
     private static void testSingleThreaded(Path testFile) throws Exception {
-        try (JUringFileChannelEnhanced channel = JUringFileChannelEnhanced.open(testFile,
+        try (JUringFileChannel channel = JUringFileChannel.open(testFile,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             
             int operations = 1000;
@@ -91,7 +91,7 @@ public class LockContentionTest {
             long duration = System.nanoTime() - start;
             double opsPerSec = operations / (duration / 1_000_000_000.0);
             
-            JUringFileChannelEnhanced.PerformanceMetrics metrics = channel.getMetrics();
+            JUringFileChannel.PerformanceMetrics metrics = channel.getMetrics();
             
             System.out.println("  Operations: " + operations);
             System.out.println("  Duration: " + (duration / 1_000_000) + " ms");
@@ -101,7 +101,7 @@ public class LockContentionTest {
     }
     
     private static void testMultiThreadedSync(Path testFile) throws Exception {
-        try (JUringFileChannelEnhanced channel = JUringFileChannelEnhanced.open(testFile,
+        try (JUringFileChannel channel = JUringFileChannel.open(testFile,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             
             int threads = 8;
@@ -142,7 +142,7 @@ public class LockContentionTest {
             
             executor.shutdown();
             
-            JUringFileChannelEnhanced.PerformanceMetrics metrics = channel.getMetrics();
+            JUringFileChannel.PerformanceMetrics metrics = channel.getMetrics();
             
             System.out.println("  Threads: " + threads);
             System.out.println("  Operations: " + totalOps);
@@ -154,7 +154,7 @@ public class LockContentionTest {
     }
     
     private static void testMultiThreadedAsync(Path testFile) throws Exception {
-        try (JUringFileChannelEnhanced channel = JUringFileChannelEnhanced.open(testFile,
+        try (JUringFileChannel channel = JUringFileChannel.open(testFile,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             
             int threads = 8;
@@ -178,7 +178,7 @@ public class LockContentionTest {
                             long offset = random.nextInt(10 * 1024 * 1024 / 8192) * 8192;
                             
                             // Use batched async API
-                            writes.add(channel.writeDirectAsyncBatched(buffer, offset));
+                            writes.add(channel.writeAsyncBatched(buffer, offset));
                         }
                         
                         // Wait once for all
@@ -200,7 +200,7 @@ public class LockContentionTest {
             
             executor.shutdown();
             
-            JUringFileChannelEnhanced.PerformanceMetrics metrics = channel.getMetrics();
+            JUringFileChannel.PerformanceMetrics metrics = channel.getMetrics();
             double batchRatio = metrics.batchSubmissions > 0 
                 ? metrics.lockAcquisitions / (double) metrics.batchSubmissions 
                 : 0;
@@ -216,7 +216,7 @@ public class LockContentionTest {
     }
     
     private static void testZeroCopy(Path testFile) throws Exception {
-        try (JUringFileChannelEnhanced channel = JUringFileChannelEnhanced.open(testFile,
+        try (JUringFileChannel channel = JUringFileChannel.open(testFile,
                 StandardOpenOption.READ, StandardOpenOption.WRITE)) {
             
             Random random = new Random();
@@ -226,7 +226,7 @@ public class LockContentionTest {
             ByteBuffer heapBuffer = ByteBuffer.allocate(8192);
             fillBuffer(heapBuffer, random);
             try {
-                channel.writeDirectAsync(heapBuffer, 0).get();
+                channel.writeAsync(heapBuffer, 0).get();
                 System.out.println("    ERROR: Heap buffer should have failed!");
             } catch (Exception e) {
                 System.out.println("    ✓ Correctly rejected heap buffer");
@@ -237,7 +237,7 @@ public class LockContentionTest {
             ByteBuffer directBuffer = ByteBuffer.allocateDirect(8192);
             fillBuffer(directBuffer, random);
             try {
-                int written = channel.writeDirectAsync(directBuffer, 0).get();
+                int written = channel.writeAsync(directBuffer, 0).get();
                 System.out.println("    ✓ Zero-copy write successful: " + written + " bytes");
             } catch (Exception e) {
                 System.out.println("    ERROR: Direct buffer write failed: " + e.getMessage());
