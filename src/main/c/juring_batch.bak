@@ -1,0 +1,269 @@
+/*
+ * juring_batch.c — Batch SQE preparation for JUring
+ *
+ * Problem: JUring calls 4 separate Panama downcalls per I/O operation:
+ *   io_uring_get_sqe, io_uring_prep_write, io_uring_sqe_set_data, io_uring_sqe_set_flags
+ * Each crossing costs ~2µs, so 100 ops = 100 × 4 × 2µs = 800µs of pure overhead.
+ * A raw pwrite64 syscall takes ~0.7µs total.
+ *
+ * Solution: One native call that prepares N SQEs and returns N user_data IDs.
+ * Java makes ONE Panama downcall → C does all the pointer math → returns.
+ *
+ * Compile:
+ *   gcc -shared -fPIC -O2 -o libjuring-batch.so juring_batch.c \
+ *       -I/path/to/liburing/src/include -luring
+ *
+ * Usage from Panama:
+ *   SymbolLookup lib = SymbolLookup.libraryLookup("libjuring-batch.so", arena);
+ *   // Look up juring_prepare_write_batch, etc.
+ */
+
+#include <liburing.h>
+#include <stdint.h>
+#include <stdatomic.h>
+
+/* Global monotonic ID counter — no collisions, no ThreadLocalRandom overhead */
+static _Atomic uint64_t g_id_counter = 1;
+
+/*
+ * Batch prepare writes.
+ *
+ * Prepares `count` WRITE SQEs in one native call.
+ * All pointer math, sqe setup, and user_data assignment happen in C.
+ *
+ * Parameters:
+ *   ring       - pointer to struct io_uring
+ *   fd         - file descriptor (or registered file index)
+ *   buffers    - array of `count` buffer pointers (void**)
+ *   offsets    - array of `count` file offsets (int64_t*)
+ *   lengths    - array of `count` buffer lengths (int32_t*)
+ *   ids_out    - output array of `count` user_data IDs (int64_t*)
+ *   count      - number of operations
+ *   flags      - SQE flags to set (e.g. IOSQE_FIXED_FILE), 0 for none
+ *
+ * Returns: number of SQEs successfully prepared (may be < count if SQ is full)
+ */
+int juring_prepare_write_batch(
+    struct io_uring *ring,
+    int fd,
+    void **buffers,
+    int64_t *offsets,
+    int32_t *lengths,
+    int64_t *ids_out,
+    int count,
+    uint8_t flags)
+{
+    int prepared = 0;
+
+    for (int i = 0; i < count; i++) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe) break;  /* SQ ring full */
+
+        io_uring_prep_write(sqe, fd, buffers[i], lengths[i], offsets[i]);
+
+        uint64_t id = atomic_fetch_add_explicit(&g_id_counter, 1, memory_order_relaxed);
+        io_uring_sqe_set_data64(sqe, id);
+
+        if (flags) {
+            io_uring_sqe_set_flags(sqe, flags);
+        }
+
+        ids_out[i] = (int64_t)id;
+        prepared++;
+    }
+
+    return prepared;
+}
+
+/*
+ * Batch prepare reads.
+ * Same pattern as writes but uses io_uring_prep_read.
+ */
+int juring_prepare_read_batch(
+    struct io_uring *ring,
+    int fd,
+    void **buffers,
+    int64_t *offsets,
+    int32_t *lengths,
+    int64_t *ids_out,
+    int count,
+    uint8_t flags)
+{
+    int prepared = 0;
+
+    for (int i = 0; i < count; i++) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe) break;
+
+        io_uring_prep_read(sqe, fd, buffers[i], lengths[i], offsets[i]);
+
+        uint64_t id = atomic_fetch_add_explicit(&g_id_counter, 1, memory_order_relaxed);
+        io_uring_sqe_set_data64(sqe, id);
+
+        if (flags) {
+            io_uring_sqe_set_flags(sqe, flags);
+        }
+
+        ids_out[i] = (int64_t)id;
+        prepared++;
+    }
+
+    return prepared;
+}
+
+/*
+ * Batch prepare writes with fixed/registered buffers.
+ * Uses io_uring_prep_write_fixed — buffers are already registered with the kernel.
+ *
+ * Parameters:
+ *   buffer_indices - array of registered buffer indices (int32_t*)
+ *   (buffers still needed to get the base address for each registered buffer)
+ */
+int juring_prepare_write_fixed_batch(
+    struct io_uring *ring,
+    int fd,
+    void **buffers,
+    int64_t *offsets,
+    int32_t *lengths,
+    int32_t *buffer_indices,
+    int64_t *ids_out,
+    int count,
+    uint8_t flags)
+{
+    int prepared = 0;
+
+    for (int i = 0; i < count; i++) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe) break;
+
+        io_uring_prep_write_fixed(sqe, fd, buffers[i], lengths[i],
+                                  offsets[i], buffer_indices[i]);
+
+        uint64_t id = atomic_fetch_add_explicit(&g_id_counter, 1, memory_order_relaxed);
+        io_uring_sqe_set_data64(sqe, id);
+
+        if (flags) {
+            io_uring_sqe_set_flags(sqe, flags);
+        }
+
+        ids_out[i] = (int64_t)id;
+        prepared++;
+    }
+
+    return prepared;
+}
+
+/*
+ * Batch prepare reads with fixed/registered buffers.
+ */
+int juring_prepare_read_fixed_batch(
+    struct io_uring *ring,
+    int fd,
+    void **buffers,
+    int64_t *offsets,
+    int32_t *lengths,
+    int32_t *buffer_indices,
+    int64_t *ids_out,
+    int count,
+    uint8_t flags)
+{
+    int prepared = 0;
+
+    for (int i = 0; i < count; i++) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+        if (!sqe) break;
+
+        io_uring_prep_read_fixed(sqe, fd, buffers[i], lengths[i],
+                                 offsets[i], buffer_indices[i]);
+
+        uint64_t id = atomic_fetch_add_explicit(&g_id_counter, 1, memory_order_relaxed);
+        io_uring_sqe_set_data64(sqe, id);
+
+        if (flags) {
+            io_uring_sqe_set_flags(sqe, flags);
+        }
+
+        ids_out[i] = (int64_t)id;
+        prepared++;
+    }
+
+    return prepared;
+}
+
+/*
+ * Submit + wait-for-N in one call.
+ * Combines io_uring_submit() + io_uring_wait_cqe_nr() into a single crossing.
+ */
+int juring_submit_and_wait(struct io_uring *ring, int wait_nr)
+{
+    int submitted = io_uring_submit(ring);
+    if (submitted < 0) return submitted;
+
+    if (wait_nr > 0) {
+        struct io_uring_cqe *cqe;
+        int ret = io_uring_wait_cqe_nr(ring, &cqe, wait_nr);
+        if (ret < 0) return ret;
+    }
+
+    return submitted;
+}
+
+/*
+ * Submit + wait + collect ALL completions in a single native call.
+ *
+ * This is the critical function that eliminates the collection loop overhead.
+ * Previously, Java had to spin calling peekBatchCqe + cqAdvance (2 Panama
+ * downcalls per iteration, often 5-20 iterations). Now it's ONE call.
+ *
+ * Flow:
+ *   1. io_uring_submit()
+ *   2. io_uring_wait_cqe_nr(wait_nr) — block until enough completions
+ *   3. io_uring_peek_batch_cqe() — peek up to max_collect CQEs
+ *   4. Extract user_data + res from each CQE into output arrays
+ *   5. io_uring_cq_advance() — advance CQ ring
+ *
+ * Parameters:
+ *   ring        - pointer to struct io_uring
+ *   wait_nr     - minimum completions to wait for before peeking
+ *   ids_out     - output array of user_data values (int64_t*, max_collect entries)
+ *   res_out     - output array of result values (int32_t*, max_collect entries)
+ *   max_collect - max CQEs to collect (size of output arrays)
+ *
+ * Returns: number of CQEs collected (written to ids_out/res_out),
+ *          or negative errno on error.
+ */
+int juring_submit_and_collect(
+    struct io_uring *ring,
+    int wait_nr,
+    int64_t *ids_out,
+    int32_t *res_out,
+    int max_collect)
+{
+    /* Step 1: Submit */
+    int submitted = io_uring_submit(ring);
+    if (submitted < 0) return submitted;
+
+    /* Step 2: Wait for at least wait_nr completions */
+    if (wait_nr > 0) {
+        struct io_uring_cqe *cqe;
+        int ret = io_uring_wait_cqe_nr(ring, &cqe, wait_nr);
+        if (ret < 0) return ret;
+    }
+
+    /* Step 3: Peek all available CQEs */
+    struct io_uring_cqe *cqes[max_collect];
+    int count = io_uring_peek_batch_cqe(ring, cqes, max_collect);
+
+    /* Step 4: Extract user_data + res */
+    for (int i = 0; i < count; i++) {
+        ids_out[i] = (int64_t)io_uring_cqe_get_data64(cqes[i]);
+        res_out[i] = cqes[i]->res;
+    }
+
+    /* Step 5: Advance CQ ring */
+    if (count > 0) {
+        io_uring_cq_advance(ring, count);
+    }
+
+    return count;
+}
