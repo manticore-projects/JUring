@@ -24,8 +24,8 @@ public class TaskCreator {
     final static Random random = new Random(315315153152442L);
 
     public static final String BENCHMARK_FILE_EXTENSION = ".bin";
-    public static final Path BASE_BENCHMARK_FILES_DIR = Path.of("/home/david/testData/text_files/");
-    public static final Path BASE_BENCHMARK_WRITE_FILES_DIR = Path.of("/home/david/testData/write_files/");
+    public static final Path BASE_BENCHMARK_FILES_DIR = Path.of(System.getProperty("java.io.tmpdir"), "juring_bench", "text_files");
+    public static final Path BASE_BENCHMARK_WRITE_FILES_DIR = Path.of(System.getProperty("java.io.tmpdir"), "juring_bench", "write_files");
 
     // for writing
     public byte[] content;

@@ -5,18 +5,22 @@ import bench.random.read.Task;
 import bench.random.read.TaskCreator;
 import bench.random.write.ExecutionPlanPreOpenedWriteFileChannels;
 import bench.random.write.ExecutionPlanWriteRegisteredFiles;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import static bench.random.read.TaskCreator.BASE_BENCHMARK_FILES_DIR;
+import static bench.random.read.TaskCreator.BASE_BENCHMARK_WRITE_FILES_DIR;
 import static com.davidvlijmincx.lio.api.IoUringOptions.IORING_SETUP_SINGLE_ISSUER;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -28,6 +32,17 @@ The idea behind these tests is the following:
 
  */
 public class JUringHighLevelTest {
+
+    @BeforeAll
+    static void setup() {
+        try {
+            Files.createDirectories(BASE_BENCHMARK_FILES_DIR);
+            Files.createDirectories(BASE_BENCHMARK_WRITE_FILES_DIR);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+
+    }
 
     @Test
     void EventLoopJUring() {

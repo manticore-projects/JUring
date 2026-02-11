@@ -3,6 +3,7 @@ plugins {
     id 'maven-publish'
 
     id "me.champeau.jmh" version "latest.release"
+    id 'bench.jmh-report'
 }
 
 repositories {
@@ -27,6 +28,57 @@ group = 'com.davidvlijmincx.lio'
 version = '0.1-SNAPSHOT'
 description = 'JUring'
 
+// ─── Native C library ───
+
+def nativeSrcDir  = file('src/main/c')
+def nativeOutDir  = layout.buildDirectory.dir('native')
+def nativeLib     = nativeOutDir.map { it.file('libjuring-batch.so') }
+
+def cc       = 'gcc'
+def cflags   = [
+        '-shared', '-fPIC',
+        '-O2', '-march=x86-64-v3', '-mtune=native',
+        '-mavx2', '-DJURING_USE_AVX2',
+        '-fno-stack-protector',
+        '-falign-functions=64',
+        '-flto',
+]
+def includes = ['/usr/include']
+def ldflags  = ['-luring']
+
+tasks.register('compileNative', Exec) {
+    description = 'Compile libjuring-batch.so'
+    group = 'build'
+
+    inputs.dir(nativeSrcDir).withPathSensitivity(PathSensitivity.RELATIVE)
+    outputs.file(nativeLib)
+
+    doFirst { nativeOutDir.get().asFile.mkdirs() }
+
+    def sources = fileTree(nativeSrcDir) { include '*.c' }.files.collect { it.path }
+
+    commandLine([cc] +
+            cflags +
+            includes.collect { "-I${it}" } +
+            ['-o', nativeLib.get().asFile.path] +
+            sources +
+            ldflags
+    )
+}
+
+compileJava.dependsOn compileNative
+
+// Copy the native lib into resources so it ends up in the JAR
+tasks.named('processResources') {
+    from(layout.buildDirectory.dir('native')) { // adjust to wherever your .so is built
+        include '*.so'
+        into 'native/linux-amd64' // organize by OS/arch
+    }
+
+    dependsOn 'compileNative' // your C compilation task
+}
+
+// ─── Java ───
 publishing {
     publications {
         maven(MavenPublication) {
@@ -55,14 +107,29 @@ java {
     }
 }
 
+def nativeLibPath = nativeOutDir.get().asFile.path
+
 jmh {
     jmhVersion = '1.37'
     jvmArgs = [
             "--enable-native-access=ALL-UNNAMED"
             , "--add-opens=java.base/sun.misc=ALL-UNNAMED"
             , "--add-opens=java.base/java.lang=ALL-UNNAMED"
+            , "-Djava.library.path=${nativeLibPath}"
+            , "-Djuring.test.dir=${findProperty('JURING_TEST_DIR') ?: ''}"
     ]
-    includes = ['bench.FileChannelDBPatterns.*']
+
+    includes = ['bench\\.JUringFileChannel\\.randomRead.*']
+
+    humanOutputFile = layout.buildDirectory.file("reports/jmh/human.txt") // human-readable output file
+    resultsFile = layout.buildDirectory.file("reports/jmh/results.json") // results file
+    resultFormat = 'JSON' // Result format type (one of CSV, JSON, NONE, SCSV, TEXT)
+}
+
+jmhReport {
+    jsonFile = layout.buildDirectory.file('reports/jmh/results.json').get().asFile
+    htmlFile = layout.buildDirectory.file('reports/jmh/results.html').get().asFile
+    title    = 'JUring vs. Standard File Channel'
 }
 
 test {
@@ -70,8 +137,17 @@ test {
 
     jvmArgs = [
             "--enable-native-access=ALL-UNNAMED",
-            "--add-opens=java.base/sun.misc=ALL-UNNAMED",
             "--add-opens=java.base/java.lang=ALL-UNNAMED",
-            "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED"
+            "--add-opens=java.base/jdk.internal.misc=ALL-UNNAMED",
     ]
+    systemProperty 'java.library.path', nativeLibPath
+    systemProperty 'juring.test.dir', findProperty('JURING_TEST_DIR') ?: ''
+}
+
+tasks.register('runDiagnostic', JavaExec) {
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.davidvlijmincx.lio.api.IODiagnostic'
+    jvmArgs '--enable-native-access=ALL-UNNAMED',
+            "--add-modules=jdk.unsupported",
+            "-Djava.library.path=${nativeLibPath}"
 }

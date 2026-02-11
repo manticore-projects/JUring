@@ -122,7 +122,7 @@ record LibUringDispatcher(Arena arena,
         LibUringDispatcher dispatcher = getDispatcher(ring);
 
         int ret = dispatcher.queueInit(queueDepth, IoUringOptions.combineOptions(ioUringOptions));
-     //  dispatcher.registerIowqMaxWorkers(1,1);
+        //  dispatcher.registerIowqMaxWorkers(1,1);
         if (ret < 0) {
             throw new RuntimeException("Failed to initialize queue " + libCDispatcher.strerror(ret));
         }
@@ -437,6 +437,33 @@ record LibUringDispatcher(Arena arena,
         libCDispatcher.free(cqePtr);
         libCDispatcher.free(cqePtrPtr);
         closeArena();
+    }
+
+    /**
+     * Peek CQEs and return raw (user_data, res) pairs.
+     * Does NOT dereference user_data as a pointer — safe when user_data
+     * is a plain int64 ID set by io_uring_sqe_set_data64.
+     */
+    List<JUring.RawCqe> peekRawBatchCqes(int maxCount) {
+        int count = peekBatchCqe(ring, cqePtrPtr, maxCount);
+
+        if (count > 0) {
+            List<JUring.RawCqe> ret = new ArrayList<>(count);
+
+            for (int i = 0; i < count; i++) {
+                var nativeCqe = cqePtrPtr.getAtIndex(ADDRESS, i)
+                                         .reinterpret(io_uring_cqe_layout.byteSize());
+
+                long userData = nativeCqe.get(JAVA_LONG, 0);  // user_data (plain int64 ID)
+                int res = nativeCqe.get(JAVA_INT, 8);          // result
+
+                ret.add(new JUring.RawCqe(userData, res));
+            }
+
+            cqAdvance.peekBatchCqe(ring, count);
+            return ret;
+        }
+        return List.of();
     }
 
 }
