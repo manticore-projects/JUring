@@ -23,7 +23,7 @@ public class TaskCreator {
 
     final static Random random = new Random(315315153152442L);
 
-    private static Path getBaseDir(String s) {
+    public static Path getBaseDir(String s) {
         String testDir = System.getProperty("juring.test.dir");
         if (testDir != null && !testDir.isEmpty()) {
             return Path.of(testDir, "juring_bench", s);
@@ -47,8 +47,8 @@ public class TaskCreator {
         System.out.println("ProcessHandle.current().pid(); = " + ProcessHandle.current().pid());
 
         // Create benchmark files if they don't exist
-        createBenchmarkFiles(BASE_BENCHMARK_FILES_DIR, 100);
-        createBenchmarkFiles(BASE_BENCHMARK_WRITE_FILES_DIR, 100);
+        createBenchmarkFiles(BASE_BENCHMARK_FILES_DIR, 100, true);
+        createBenchmarkFiles(BASE_BENCHMARK_WRITE_FILES_DIR, 100, false);
 
         readTasks = getTasks(2211, 1);
         writeTasks = getTasks(2211, 0);
@@ -59,15 +59,26 @@ public class TaskCreator {
         ms = MemorySegment.ofBuffer(bb);
     }
 
-    private void createBenchmarkFiles(Path dir, int count) {
+    private void createBenchmarkFiles(Path dir, int count, boolean repeatingContent) {
         if (Files.exists(dir)) return;
         try {
             Files.createDirectories(dir);
-            byte[] data = bytesToWrite(64 * 1024); // 64KB per file
             for (int i = 0; i < count; i++) {
-                Files.write(dir.resolve("file_" + i + BENCHMARK_FILE_EXTENSION), data);
+                String prefix = dir.equals(BASE_BENCHMARK_FILES_DIR) ? "text_" : "write_";
+                Path file = dir.resolve(prefix + i + BENCHMARK_FILE_EXTENSION);
+                byte[] data;
+                if (repeatingContent) {
+                    // Match the test's pattern: repeating "i\n" so reads contain the number
+                    String token = String.valueOf(i);
+                    String line = token + "\n";
+                    StringBuilder sb = new StringBuilder(65536);
+                    while (sb.length() < 65536) sb.append(line);
+                    data = sb.substring(0, 65536).getBytes();
+                } else {
+                    data = bytesToWrite(65536);
+                }
+                Files.write(file, data);
             }
-            System.out.printf("[SETUP] Created %d benchmark files in %s%n", count, dir);
         } catch (IOException e) {
             throw new RuntimeException("Failed to create benchmark files in " + dir, e);
         }

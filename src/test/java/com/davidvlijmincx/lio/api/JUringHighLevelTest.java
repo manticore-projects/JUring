@@ -39,6 +39,18 @@ public class JUringHighLevelTest {
     @BeforeAll
     static void setup() {
         try {
+            // Wipe and recreate — ensures no stale files from benchmarks
+            if (Files.exists(BASE_BENCHMARK_FILES_DIR)) {
+                try (var files = Files.list(BASE_BENCHMARK_FILES_DIR)) {
+                    files.forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
+                }
+            }
+            if (Files.exists(BASE_BENCHMARK_WRITE_FILES_DIR)) {
+                try (var files = Files.list(BASE_BENCHMARK_WRITE_FILES_DIR)) {
+                    files.forEach(p -> { try { Files.delete(p); } catch (IOException ignored) {} });
+                }
+            }
+
             Files.createDirectories(BASE_BENCHMARK_FILES_DIR);
             Files.createDirectories(BASE_BENCHMARK_WRITE_FILES_DIR);
 
