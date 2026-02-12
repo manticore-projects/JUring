@@ -28,7 +28,7 @@ dependencies {
     testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine:5.11.4'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.11.4'
     testImplementation 'org.junit.jupiter:junit-jupiter-params:5.11.4'
-    testImplementation("org.assertj:assertj-core:+")
+    testImplementation("org.assertj:assertj-core")
 }
 
 def getVersion = { boolean considerSnapshot ->
@@ -159,16 +159,18 @@ compileJava.dependsOn compileNative
 
 // Copy the native lib into resources so it ends up in the JAR
 tasks.named('processResources') {
-    from(layout.buildDirectory.dir('native')) { // adjust to wherever your .so is built
+    from(layout.buildDirectory.dir('native')) {
         include '*.so'
-        into 'native/linux-amd64' // organize by OS/arch
+        into 'native/linux-amd64'
     }
 
-    dependsOn 'compileNative' // your C compilation task
+    dependsOn 'compileNative'
 }
 
 // ─── Java ───
 mavenPublishing {
+    publishToMavenCentral()
+    signAllPublications()
     coordinates(group, "juring", version)
 
     pom {
@@ -210,52 +212,23 @@ signing {
     required { !version.endsWith("SNAPSHOT") && gradle.taskGraph.hasTask("publish") }
 }
 
-// Resolve dynamic dependencies to concrete versions in POM
-publishing {
-    publications {
-        configureEach {
-            if (it instanceof MavenPublication) {
-                // Suppress the warning about Maven-incompatible version notation
-                it.suppressPomMetadataWarningsFor('runtimeElements')
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
 
-                it.pom.withXml {
-                    def runtimeDeps = project.configurations.runtimeClasspath
-                            .resolvedConfiguration
-                            .firstLevelModuleDependencies
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
 
-                    def depsNode = asNode().dependencies?.dependency
-
-                    depsNode?.each { depNode ->
-                        def groupId = depNode.groupId.text()
-                        def artifactId = depNode.artifactId.text()
-
-                        // Find the resolved dependency
-                        def resolved = runtimeDeps.find {
-                            it.moduleGroup == groupId && it.moduleName == artifactId
-                        }
-
-                        if (resolved != null) {
-                            // Replace dynamic version (+, latest.release, etc.) with resolved version
-                            depNode.version[0].value = resolved.moduleVersion
-                        }
-                    }
-                }
-            }
-        }
+    if (JavaVersion.current().isJava9Compatible()) {
+        options.addBooleanOption('html5', true)
     }
-}
-
-tasks.withType(JavaCompile) {
-    options.encoding = 'UTF-8'
-}
-
-tasks.withType(Javadoc) {
-    options.encoding = 'UTF-8'
+    options.addBooleanOption("Xdoclint:none", true)
 }
 
 java {
     withSourcesJar()
-    withJavadocJar()
+    // fails w/ the Maven Publishing, although the JavaDocJar is still built and published
+    //withJavadocJar()
 
     sourceCompatibility = '23'
     targetCompatibility = '23'
@@ -279,9 +252,9 @@ jmh {
 
     includes = ['bench\\.random\\.*']
 
-    humanOutputFile = layout.buildDirectory.file("reports/jmh/human.txt") // human-readable output file
-    resultsFile = layout.buildDirectory.file("reports/jmh/results.json") // results file
-    resultFormat = 'JSON' // Result format type (one of CSV, JSON, NONE, SCSV, TEXT)
+    humanOutputFile = layout.buildDirectory.file("reports/jmh/human.txt")
+    resultsFile = layout.buildDirectory.file("reports/jmh/results.json")
+    resultFormat = 'JSON'
 }
 
 jmhReport {
