@@ -1,6 +1,7 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio.channel;
 
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
+import com.davidvlijmincx.lio.api.LinuxOpenOptions;
+import com.davidvlijmincx.lio.api.ReadResult;
 import org.junit.jupiter.api.*;
 
 import java.io.IOException;

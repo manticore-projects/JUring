@@ -23,9 +23,17 @@ public class TaskCreator {
 
     final static Random random = new Random(315315153152442L);
 
+    private static Path getBaseDir(String s) {
+        String testDir = System.getProperty("juring.test.dir");
+        if (testDir != null && !testDir.isEmpty()) {
+            return Path.of(testDir, "juring_bench", s);
+        }
+        return Path.of(System.getProperty("java.io.tmpdir"), "juring_bench", s);
+    }
+
     public static final String BENCHMARK_FILE_EXTENSION = ".bin";
-    public static final Path BASE_BENCHMARK_FILES_DIR = Path.of(System.getProperty("java.io.tmpdir"), "juring_bench", "text_files");
-    public static final Path BASE_BENCHMARK_WRITE_FILES_DIR = Path.of(System.getProperty("java.io.tmpdir"), "juring_bench", "write_files");
+    public static final Path BASE_BENCHMARK_FILES_DIR = getBaseDir( "text_files");
+    public static final Path BASE_BENCHMARK_WRITE_FILES_DIR = getBaseDir( "write_files");
 
     // for writing
     public byte[] content;
@@ -36,8 +44,12 @@ public class TaskCreator {
 
     @Setup
     public void setup() {
-
         System.out.println("ProcessHandle.current().pid(); = " + ProcessHandle.current().pid());
+
+        // Create benchmark files if they don't exist
+        createBenchmarkFiles(BASE_BENCHMARK_FILES_DIR, 100);
+        createBenchmarkFiles(BASE_BENCHMARK_WRITE_FILES_DIR, 100);
+
         readTasks = getTasks(2211, 1);
         writeTasks = getTasks(2211, 0);
         content = bytesToWrite(bufferSize);
@@ -45,6 +57,20 @@ public class TaskCreator {
         bb.put(content);
         bb.flip();
         ms = MemorySegment.ofBuffer(bb);
+    }
+
+    private void createBenchmarkFiles(Path dir, int count) {
+        if (Files.exists(dir)) return;
+        try {
+            Files.createDirectories(dir);
+            byte[] data = bytesToWrite(64 * 1024); // 64KB per file
+            for (int i = 0; i < count; i++) {
+                Files.write(dir.resolve("file_" + i + BENCHMARK_FILE_EXTENSION), data);
+            }
+            System.out.printf("[SETUP] Created %d benchmark files in %s%n", count, dir);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create benchmark files in " + dir, e);
+        }
     }
 
     public Task[] getTasks(int numberOfTask, double readWriteRatio){

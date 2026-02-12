@@ -1,6 +1,6 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio.channel;
 
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
+import com.davidvlijmincx.lio.api.LinuxOpenOptions;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
@@ -10,7 +10,7 @@ import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.*;
 
-class JUringFileChannelTest {
+class SizeLockTruncateTest {
 
     @TempDir
     Path tempDir;

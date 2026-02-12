@@ -1,6 +1,6 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio.channel;
 
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
+import com.davidvlijmincx.lio.api.LinuxOpenOptions;
 import com.davidvlijmincx.lio.channel.JUringFileChannel.BatchReadOp;
 import com.davidvlijmincx.lio.channel.JUringFileChannel.BatchWriteOp;
 import com.sun.nio.file.ExtendedOpenOption;

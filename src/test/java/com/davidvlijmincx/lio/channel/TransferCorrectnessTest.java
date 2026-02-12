@@ -1,9 +1,9 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio.channel;
 
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
+import com.davidvlijmincx.lio.JUringTempDir;
+import com.davidvlijmincx.lio.api.LinuxOpenOptions;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.RegisterExtension;
-import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.*;
  * Every test writes a known byte pattern, transfers it, then reads back and
  * asserts byte-for-byte equality.
  */
-class JUringTransferCorrectnessTest {
+class TransferCorrectnessTest {
 
     @RegisterExtension
     JUringTempDir tempDir = new JUringTempDir();
@@ -47,8 +47,8 @@ class JUringTransferCorrectnessTest {
     /** Open a JUringFileChannel for the given path. */
     private JUringFileChannel openJUring(Path path) throws IOException {
         return JUringFileChannel.open(path,
-                LinuxOpenOptions.READ_DIRECT,
-                LinuxOpenOptions.WRITE_DIRECT);
+                                      LinuxOpenOptions.READ_DIRECT,
+                                      LinuxOpenOptions.WRITE_DIRECT);
     }
 
     /** Open a standard FileChannel for the given path. */

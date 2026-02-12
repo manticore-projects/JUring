@@ -1,8 +1,7 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio.channel;
 
 import com.davidvlijmincx.lio.api.LinuxOpenOptions;
 import com.davidvlijmincx.lio.api.ReadResult;
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
 import com.davidvlijmincx.lio.channel.JUringFileChannel.BatchReadOp;
 import com.davidvlijmincx.lio.channel.JUringFileChannel.BatchWriteOp;
 import org.junit.jupiter.api.AfterEach;
@@ -74,7 +73,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * All buffers are 4096-aligned (O_DIRECT requirement).
  * Each test writes a distinct byte pattern so we can detect wrong-offset or data corruption bugs.
  */
-public class JUringFileChannelCorrectnessTest {
+public class DBPatternsCorrectnessTest {
 
     private static final int PAGE_SIZE = 8192;       // matches benchmark
     private static final int NUM_PAGES = 100;         // matches OPS_PER_INVOCATION

@@ -33,15 +33,59 @@ The idea behind these tests is the following:
  */
 public class JUringHighLevelTest {
 
+    private static final int TEST_FILE_SIZE = 65_536; // 64 KB per file
+    private static final int NUM_TEST_FILES = 20;
+
     @BeforeAll
     static void setup() {
         try {
             Files.createDirectories(BASE_BENCHMARK_FILES_DIR);
             Files.createDirectories(BASE_BENCHMARK_WRITE_FILES_DIR);
+
+            // Set bufferSize — outside JMH the @Param annotation has no effect,
+            // so it stays at the default int value of 0.
+            TaskCreator.bufferSize = 4096;
+
+            // Create read files: text_0.bin .. text_19.bin
+            // Each file is filled by repeating its number so that reading at
+            // ANY offset will produce a string that contains the number.
+            for (int i = 0; i < NUM_TEST_FILES; i++) {
+                Path file = BASE_BENCHMARK_FILES_DIR.resolve("text_" + i + ".bin");
+                if (!Files.exists(file)) {
+                    String token = String.valueOf(i);
+                    byte[] content = generateRepeatingContent(token, TEST_FILE_SIZE);
+                    Files.write(file, content);
+                }
+            }
+
+            // Create write files: write_0.bin .. write_19.bin
+            // Content doesn't matter — these will be overwritten by tests.
+            for (int i = 0; i < NUM_TEST_FILES; i++) {
+                Path file = BASE_BENCHMARK_WRITE_FILES_DIR.resolve("write_" + i + ".bin");
+                if (!Files.exists(file)) {
+                    byte[] content = new byte[TEST_FILE_SIZE];
+                    Arrays.fill(content, (byte) '0');
+                    Files.write(file, content);
+                }
+            }
+
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
 
+    /**
+     * Fills a byte array of the given size by repeating {@code token + "\n"}.
+     * This guarantees that a read at any offset will contain the token
+     * within the first {@code token.length() + 1} bytes.
+     */
+    private static byte[] generateRepeatingContent(String token, int size) {
+        String line = token + "\n";
+        StringBuilder sb = new StringBuilder(size + line.length());
+        while (sb.length() < size) {
+            sb.append(line);
+        }
+        return sb.substring(0, size).getBytes();
     }
 
     @Test
@@ -99,7 +143,7 @@ public class JUringHighLevelTest {
             }
             processed += results.size();
         }
-       assertThat(processed).isEqualTo(2211);
+        assertThat(processed).isEqualTo(2211);
 
         plan.jUring.close();
     }
@@ -183,11 +227,11 @@ public class JUringHighLevelTest {
 
         final var jUring = plan.jUring;
         final var writeTasks = new ArrayList<>(Arrays.stream(taskCreator.writeTasks)
-                .collect(Collectors.toMap(
-                        Task::path,
-                        Function.identity(),
-                        (existing, _) -> existing))
-                .values()).toArray(new Task[0]);
+                                                     .collect(Collectors.toMap(
+                                                             Task::path,
+                                                             Function.identity(),
+                                                             (existing, _) -> existing))
+                                                     .values()).toArray(new Task[0]);
 
         assertThat(writeTasks).hasSizeGreaterThan(18);
 
@@ -283,11 +327,11 @@ public class JUringHighLevelTest {
 
         final var jUring =  new JUring(2500, IORING_SETUP_SINGLE_ISSUER);
         final var writeTasks = new ArrayList<>(Arrays.stream(taskCreator.writeTasks)
-                .collect(Collectors.toMap(
-                        Task::path,
-                        Function.identity(),
-                        (existing, _) -> existing))
-                .values()).toArray(new Task[0]);
+                                                     .collect(Collectors.toMap(
+                                                             Task::path,
+                                                             Function.identity(),
+                                                             (existing, _) -> existing))
+                                                     .values()).toArray(new Task[0]);
 
         ArrayList<FileDescriptor> openFiles = new ArrayList<>(writeTasks.length);
         Map<Long, Task> matchIdWithFile = new HashMap<>();

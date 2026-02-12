@@ -1,8 +1,8 @@
-package bench;
+package com.davidvlijmincx.lio.channel;
 
-import com.davidvlijmincx.lio.api.JUringTempDir;
+import com.davidvlijmincx.lio.JUringTempDir;
 import com.davidvlijmincx.lio.api.LinuxOpenOptions;
-import com.davidvlijmincx.lio.channel.JUringFileChannel;
+import com.sun.nio.file.ExtendedOpenOption;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -17,47 +17,36 @@ import java.nio.file.StandardOpenOption;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Quick performance comparison: JUring transfer vs standard FileChannel.
+ * Apples-to-apples performance comparison: JUring vs standard FileChannel,
+ * both using O_DIRECT.
  *
- * <p><b>Important:</b> JUringFileChannel opens files with O_DIRECT, bypassing
- * the kernel page cache.  Standard FileChannel uses buffered I/O, so source
- * files created moments ago are warm in page cache.  This makes the comparison
- * inherently unfair for small transfers — standard NIO reads from RAM while
- * JUring hits storage.  The O_DIRECT path wins for large sequential writes
- * in database-style workloads (no double buffering), but shows higher latency
- * on warmed benchmarks like this one.</p>
+ * <p>Both sides bypass the page cache, so the comparison isolates the
+ * actual transfer mechanism: io_uring copy_file_range vs NIO sendfile,
+ * batched async io_uring vs synchronous NIO, etc.</p>
  *
- * <p>For rigorous, statistically sound numbers, use the JMH benchmark
- * ({@code TransferBenchmark}).</p>
+ * <p>Standard FileChannel gets O_DIRECT via {@code com.sun.nio.file.ExtendedOpenOption.DIRECT}
+ * (public API since JDK 10, no --add-opens required).</p>
  *
  * Run with:  {@code ./gradlew test --tests '*TransferPerformanceTest*' -i}
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-class JUringTransferPerformanceTest {
+class TransferPerformanceTest {
 
     @RegisterExtension
-    JUringTempDir tempDir = new JUringTempDir();
+    JUringTempDir tmp = new JUringTempDir();
 
     private static final int WARMUP_ITERATIONS  = 5;
     private static final int MEASURED_ITERATIONS = 20;
 
-    @BeforeAll
-    static void printCaveat() {
-        System.out.println();
-        System.out.println("╔══════════════════════════════════════════════════════════════════════════════╗");
-        System.out.println("║  NOTE: JUring uses O_DIRECT (bypasses page cache).  Standard NIO uses      ║");
-        System.out.println("║  buffered I/O (source file is warm in page cache).  This is NOT an         ║");
-        System.out.println("║  apples-to-apples comparison of the transfer mechanism — it measures the    ║");
-        System.out.println("║  combined effect of O_DIRECT + copy_file_range vs page-cached sendfile.    ║");
-        System.out.println("║  JUring's advantage shows in sustained workloads that would blow the cache. ║");
-        System.out.println("╚══════════════════════════════════════════════════════════════════════════════╝");
-        System.out.println();
-    }
-
     // ---------------------------------------------------------------- helpers
 
+    /**
+     * Creates a source file using buffered I/O (page-cached write), then
+     * forces to disk.  The actual benchmarks open it with O_DIRECT so
+     * every read hits storage.
+     */
     private Path createSourceFile(String name, int sizeBytes) throws IOException {
-        Path p = tempDir.resolve(name);
+        Path p = tmp.resolve(name);
         byte[] buf = new byte[Math.min(sizeBytes, 64 * 1024)];
         ThreadLocalRandom.current().nextBytes(buf);
         try (FileChannel ch = FileChannel.open(p,
@@ -125,7 +114,7 @@ class JUringTransferPerformanceTest {
     @ParameterizedTest(name = "transferTo — {0} bytes")
     @ValueSource(ints = { 4096, 65536, 1048576, 16777216, 67108864 })
     @Order(1)
-    @DisplayName("transferTo: JUring (O_DIRECT) vs Standard (page-cached)")
+    @DisplayName("transferTo: JUring O_DIRECT vs Standard O_DIRECT")
     void benchTransferTo(int sizeBytes) throws IOException {
         Path srcPath = createSourceFile("bench-src-to-" + sizeBytes, sizeBytes);
 
@@ -134,7 +123,7 @@ class JUringTransferPerformanceTest {
 
         // ---- JUring (O_DIRECT + copy_file_range) ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("jj-to-" + sizeBytes + "-" + i);
+            Path dstPath = tmp.resolve("jj-to-" + sizeBytes + "-" + i);
             try (JUringFileChannel src = JUringFileChannel.open(srcPath,
                                                                 LinuxOpenOptions.READ_DIRECT, LinuxOpenOptions.WRITE_DIRECT);
                     JUringFileChannel dst = JUringFileChannel.open(dstPath,
@@ -151,12 +140,14 @@ class JUringTransferPerformanceTest {
             Files.deleteIfExists(dstPath);
         }
 
-        // ---- Standard FileChannel (page-cached + sendfile) ----
+        // ---- Standard FileChannel (O_DIRECT + sendfile) ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("std-to-" + sizeBytes + "-" + i);
-            try (FileChannel src = FileChannel.open(srcPath, StandardOpenOption.READ);
+            Path dstPath = tmp.resolve("std-to-" + sizeBytes + "-" + i);
+            try (FileChannel src = FileChannel.open(srcPath,
+                                                    StandardOpenOption.READ, ExtendedOpenOption.DIRECT);
                     FileChannel dst = FileChannel.open(dstPath,
-                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                                                       ExtendedOpenOption.DIRECT)) {
 
                 long start = System.nanoTime();
                 long transferred = transferToFully(src, dst, sizeBytes);
@@ -172,7 +163,7 @@ class JUringTransferPerformanceTest {
         System.out.println();
         System.out.println("=== transferTo  (" + humanSize(sizeBytes) + ") ===");
         report("JUring  (O_DIRECT + copy_file_range)", sizeBytes, juringNanos);
-        report("Standard (page-cached + sendfile)",    sizeBytes, standardNanos);
+        report("Standard (O_DIRECT + sendfile)",       sizeBytes, standardNanos);
         double speedup = median(standardNanos) / (double) median(juringNanos);
         System.out.printf("  >> JUring is %.2fx %s%n", speedup, speedup >= 1.0 ? "FASTER" : "slower");
     }
@@ -182,7 +173,7 @@ class JUringTransferPerformanceTest {
     @ParameterizedTest(name = "transferFrom — {0} bytes")
     @ValueSource(ints = { 4096, 65536, 1048576, 16777216, 67108864 })
     @Order(2)
-    @DisplayName("transferFrom: JUring (O_DIRECT) vs Standard (page-cached)")
+    @DisplayName("transferFrom: JUring O_DIRECT vs Standard O_DIRECT")
     void benchTransferFrom(int sizeBytes) throws IOException {
         Path srcPath = createSourceFile("bench-src-from-" + sizeBytes, sizeBytes);
 
@@ -191,7 +182,7 @@ class JUringTransferPerformanceTest {
 
         // ---- JUring (O_DIRECT + copy_file_range) ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("jj-from-" + sizeBytes + "-" + i);
+            Path dstPath = tmp.resolve("jj-from-" + sizeBytes + "-" + i);
             try (JUringFileChannel src = JUringFileChannel.open(srcPath,
                                                                 LinuxOpenOptions.READ_DIRECT, LinuxOpenOptions.WRITE_DIRECT);
                     JUringFileChannel dst = JUringFileChannel.open(dstPath,
@@ -210,12 +201,14 @@ class JUringTransferPerformanceTest {
             Files.deleteIfExists(dstPath);
         }
 
-        // ---- Standard FileChannel (page-cached) ----
+        // ---- Standard FileChannel (O_DIRECT) ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("std-from-" + sizeBytes + "-" + i);
-            try (FileChannel src = FileChannel.open(srcPath, StandardOpenOption.READ);
+            Path dstPath = tmp.resolve("std-from-" + sizeBytes + "-" + i);
+            try (FileChannel src = FileChannel.open(srcPath,
+                                                    StandardOpenOption.READ, ExtendedOpenOption.DIRECT);
                     FileChannel dst = FileChannel.open(dstPath,
-                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                                                       ExtendedOpenOption.DIRECT)) {
 
                 long start = System.nanoTime();
                 long transferred = transferFromFully(dst, src, sizeBytes);
@@ -231,7 +224,7 @@ class JUringTransferPerformanceTest {
         System.out.println();
         System.out.println("=== transferFrom  (" + humanSize(sizeBytes) + ") ===");
         report("JUring  (O_DIRECT + copy_file_range)", sizeBytes, juringNanos);
-        report("Standard (page-cached)",               sizeBytes, standardNanos);
+        report("Standard (O_DIRECT)",                  sizeBytes, standardNanos);
         double speedup = median(standardNanos) / (double) median(juringNanos);
         System.out.printf("  >> JUring is %.2fx %s%n", speedup, speedup >= 1.0 ? "FASTER" : "slower");
     }
@@ -241,20 +234,21 @@ class JUringTransferPerformanceTest {
     @ParameterizedTest(name = "transferTo fallback (JUring→Std) — {0} bytes")
     @ValueSource(ints = { 65536, 1048576, 16777216 })
     @Order(3)
-    @DisplayName("transferTo fallback: JUring → Standard (batched async) vs Standard → Standard")
+    @DisplayName("transferTo fallback: JUring → Std O_DIRECT vs Std O_DIRECT → Std O_DIRECT")
     void benchTransferTo_fallback(int sizeBytes) throws IOException {
         Path srcPath = createSourceFile("bench-src-fb-" + sizeBytes, sizeBytes);
 
         long[] juringFallbackNanos = new long[MEASURED_ITERATIONS];
         long[] standardNanos       = new long[MEASURED_ITERATIONS];
 
-        // ---- JUring → Standard FileChannel (batched io_uring read → std write) ----
+        // ---- JUring → Standard FileChannel O_DIRECT (batched io_uring read → std write) ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("fb-" + sizeBytes + "-" + i);
+            Path dstPath = tmp.resolve("fb-" + sizeBytes + "-" + i);
             try (JUringFileChannel src = JUringFileChannel.open(srcPath,
                                                                 LinuxOpenOptions.READ_DIRECT, LinuxOpenOptions.WRITE_DIRECT);
                     FileChannel dst = FileChannel.open(dstPath,
-                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                                                       ExtendedOpenOption.DIRECT)) {
 
                 long start = System.nanoTime();
                 long transferred = src.transferTo(0, sizeBytes, dst);
@@ -267,12 +261,14 @@ class JUringTransferPerformanceTest {
             Files.deleteIfExists(dstPath);
         }
 
-        // ---- Standard → Standard (loop to handle short transfers) ----
+        // ---- Standard O_DIRECT → Standard O_DIRECT ----
         for (int i = 0; i < WARMUP_ITERATIONS + MEASURED_ITERATIONS; i++) {
-            Path dstPath = tempDir.resolve("ss-" + sizeBytes + "-" + i);
-            try (FileChannel src = FileChannel.open(srcPath, StandardOpenOption.READ);
+            Path dstPath = tmp.resolve("ss-" + sizeBytes + "-" + i);
+            try (FileChannel src = FileChannel.open(srcPath,
+                                                    StandardOpenOption.READ, ExtendedOpenOption.DIRECT);
                     FileChannel dst = FileChannel.open(dstPath,
-                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+                                                       StandardOpenOption.CREATE, StandardOpenOption.WRITE,
+                                                       ExtendedOpenOption.DIRECT)) {
 
                 long start = System.nanoTime();
                 long transferred = transferToFully(src, dst, sizeBytes);
@@ -287,8 +283,8 @@ class JUringTransferPerformanceTest {
 
         System.out.println();
         System.out.println("=== transferTo fallback  (" + humanSize(sizeBytes) + ") ===");
-        report("JUring → Std (batched O_DIRECT read)", sizeBytes, juringFallbackNanos);
-        report("Standard → Std (sendfile)",            sizeBytes, standardNanos);
+        report("JUring → Std O_DIRECT (batched read)", sizeBytes, juringFallbackNanos);
+        report("Std O_DIRECT → Std O_DIRECT",          sizeBytes, standardNanos);
         double speedup = median(standardNanos) / (double) median(juringFallbackNanos);
         System.out.printf("  >> JUring fallback is %.2fx %s than standard%n",
                           speedup, speedup >= 1.0 ? "FASTER" : "slower");

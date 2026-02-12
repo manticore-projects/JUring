@@ -61,7 +61,7 @@ import java.util.concurrent.TimeUnit;
 @Warmup(iterations = 1, time = 2)
 @Measurement(iterations = 2, time = 5)
 @Fork(value = 1, jvmArgs = {"-Xms2g", "-Xmx2g", "--add-modules=jdk.unsupported"})
-public class JUringFileChannel {
+public class DBPatterns {
 
     private static final int FILE_SIZE_MB = 512;  // 1GB — must exceed NVMe DRAM cache (~256MB-1GB)
     private static final long FILE_SIZE_BYTES = FILE_SIZE_MB * 1024L * 1024;

@@ -23,7 +23,7 @@ import java.util.concurrent.TimeUnit;
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @OperationsPerInvocation(2211)
-@Fork(value = 0, jvmArgs = {
+@Fork(value = 1, jvmArgs = {
         "--enable-native-access=ALL-UNNAMED"
 })
 @Threads(1)

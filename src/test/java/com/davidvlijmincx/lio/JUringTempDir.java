@@ -1,11 +1,10 @@
-package com.davidvlijmincx.lio.api;
+package com.davidvlijmincx.lio;
 
 import org.junit.jupiter.api.extension.*;
 
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.Comparator;
 
 /**
  * JUnit 5 extension that provides a per-test temporary directory on a
