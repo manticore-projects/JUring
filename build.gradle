@@ -70,7 +70,7 @@ def getVersion = { boolean considerSnapshot ->
 // for publishing a release, call Gradle with Environment Variable RELEASE:
 // RELEASE=true gradle JUring:publish
 version = getVersion( !System.getenv("RELEASE") )
-group = 'com.manticore-projects.jdbc'
+group = 'com.manticore-projects.tools'
 description = 'JUring'
 
 tasks.register('generateBuildInfo') {
@@ -169,7 +169,7 @@ tasks.named('processResources') {
 
 // ─── Java ───
 mavenPublishing {
-    publishToMavenCentral()
+    publishToMavenCentral(true)
     signAllPublications()
     coordinates(group, "juring", version)
 
@@ -280,5 +280,6 @@ tasks.register('runDiagnostic', JavaExec) {
     mainClass = 'com.davidvlijmincx.lio.api.IODiagnostic'
     jvmArgs '--enable-native-access=ALL-UNNAMED',
             "--add-modules=jdk.unsupported",
-            "-Djava.library.path=${nativeLibPath}"
+            "-Djava.library.path=${nativeLibPath}",
+            "-Djuring.test.dir=${findProperty('JURING_TEST_DIR') ?: ''}"
 }

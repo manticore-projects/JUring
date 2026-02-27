@@ -70,7 +70,8 @@ public class JUringFileChannel extends FileChannel {
     // CQ lock: guards completion collection. Poller uses tryLock, sync batch uses lock.
     private final ReentrantLock cqLock = new ReentrantLock();
 
-    private final Thread poller;
+    private Thread poller;
+    private final CountDownLatch pollerDone = new CountDownLatch(1);
 
     // Batch mode depth counter for async deferred submission
     private final ThreadLocal<Integer> batchDepth = ThreadLocal.withInitial(() -> 0);
@@ -83,6 +84,18 @@ public class JUringFileChannel extends FileChannel {
      * Total: ~160KB per thread (6 arrays × MAX_SQ_BATCH entries).
      */
     private static class BatchArrays {
+        // FIX (Bug 1): The Arena MUST be stored as a field. Arena.ofAuto() frees
+        // its native memory when the Arena object itself becomes unreachable (via
+        // a GC Cleaner / phantom reference). The MemorySegment objects allocated
+        // from it hold no strong reference back to the Arena, so if the Arena is
+        // only a transient constructor argument (as it was before this fix), the
+        // GC can reclaim it at the very next collection — unmapping all the
+        // native memory that bufPtrs, offsets, lengths, etc. point into.
+        // Native code then dereferences these stale pointers → SIGSEGV.
+        // Storing the Arena here keeps it alive for exactly as long as the
+        // BatchArrays instance lives (i.e., the lifetime of the owning thread).
+        final Arena arena;
+
         final MemorySegment bufPtrs;  // void** — buffer addresses
         final MemorySegment offsets;  // int64_t* — file offsets
         final MemorySegment lengths;  // int32_t* — buffer lengths
@@ -97,7 +110,8 @@ public class JUringFileChannel extends FileChannel {
         final MemorySegment fixBufIdx;
         final MemorySegment fixIdsOut;
 
-        BatchArrays(Arena arena, int capacity) {
+        BatchArrays(int capacity) {
+            this.arena    = Arena.ofAuto();   // stored — will not be GC'd prematurely
             this.bufPtrs  = arena.allocate(ADDRESS, capacity);
             this.offsets  = arena.allocate(JAVA_LONG, capacity);
             this.lengths  = arena.allocate(JAVA_INT, capacity);
@@ -114,7 +128,7 @@ public class JUringFileChannel extends FileChannel {
     }
 
     private final ThreadLocal<BatchArrays> threadArrays = ThreadLocal.withInitial(
-            () -> new BatchArrays(Arena.ofAuto(), MAX_SQ_BATCH));
+            () -> new BatchArrays(MAX_SQ_BATCH));
 
     // ==================== CONSTRUCTION ====================
 
@@ -123,7 +137,13 @@ public class JUringFileChannel extends FileChannel {
     }
 
     private JUringFileChannel(Path path, Set<OpenOption> options) throws IOException {
-        this.ring = new JUring(QUEUE_DEPTH, IoUringOptions.IORING_SETUP_SQPOLL);
+        // FIX (Bug 2): Must NOT use IORING_SETUP_SQPOLL. The kernel polling
+        // thread it creates can consume SQEs and post CQEs before
+        // submitAndCollect runs. BatchDispatcher stores plain integer IDs in
+        // CQE.user_data; the async poller expects UserData struct pointers.
+        // Mixing both on the same CQ ring causes CQE mismatches / silent data
+        // loss, and can dereference garbage IDs as struct pointers → SIGSEGV.
+        this.ring = new JUring(QUEUE_DEPTH);
 
         // Ensure the file exists — O_DIRECT opens don't imply O_CREAT
         if (!java.nio.file.Files.exists(path)) {
@@ -135,9 +155,13 @@ public class JUringFileChannel extends FileChannel {
         this.rawFd = fd.getFd();
         this.fdIndex = ring.registerFiles(fd);
 
-        this.poller = new Thread(this::pollLoop, "juring-poller");
-        this.poller.setDaemon(true);
-        this.poller.start();
+        // Poller NOT started by default.  H2 uses the sync batch path
+        // (BatchDispatcher) exclusively.  BatchDispatcher encodes integer IDs
+        // in CQE user_data, but peekForBatchResult expects UserData struct
+        // pointers — mixing them on the same CQ ring causes SIGSEGV.
+        // Call startPoller() only for true async single-op I/O that does NOT
+        // coexist with BatchDispatcher on the same ring.
+        this.poller = null;
     }
 
     public MemorySegment[] setupFixedBuffers(int size, int nrOfBuffers) {
@@ -157,6 +181,21 @@ public class JUringFileChannel extends FileChannel {
                                                                         FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG));
     private static final MethodHandle FCNTL = LINKER.downcallHandle(LIBRARIES.find("fcntl").get(),
                                                                     FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS));
+    private static final MethodHandle FSYNC = LINKER.downcallHandle(LIBRARIES.find("fsync").get(),
+                                                                    FunctionDescriptor.of(JAVA_INT, JAVA_INT));
+    private static final MethodHandle FDATASYNC = LINKER.downcallHandle(LIBRARIES.find("fdatasync").get(),
+                                                                        FunctionDescriptor.of(JAVA_INT, JAVA_INT));
+
+    // ── Direct pread/pwrite ── bypass io_uring ring for single-op I/O ──────
+    // Same pattern as force() already using FSYNC/FDATASYNC directly.
+    // Eliminates cqLock + submissionLock + BatchDispatcher + CQE matching
+    // overhead for the demand-read hot path (~5µs vs ~50-200µs per op).
+    private static final MethodHandle PREAD = LINKER.downcallHandle(LIBRARIES.find("pread").get(),
+                                                                    FunctionDescriptor.of(JAVA_LONG, JAVA_INT, ADDRESS, JAVA_LONG, JAVA_LONG));
+    private static final MethodHandle PWRITE = LINKER.downcallHandle(LIBRARIES.find("pwrite").get(),
+                                                                     FunctionDescriptor.of(JAVA_LONG, JAVA_INT, ADDRESS, JAVA_LONG, JAVA_LONG));
+    private static final MethodHandle POSIX_CLOSE = LINKER.downcallHandle(LIBRARIES.find("close").get(),
+                                                                          FunctionDescriptor.of(JAVA_INT, JAVA_INT));
 
     // copy_file_range(int fd_in, off64_t *off_in, int fd_out, off64_t *off_out, size_t len, uint flags)
     // Returns ssize_t (number of bytes copied, or -1 on error)
@@ -304,22 +343,39 @@ public class JUringFileChannel extends FileChannel {
     // ==================== POLLER (async path only) ====================
 
     private void pollLoop() {
-        while (!closed.get()) {
-            if (cqLock.tryLock()) {
-                try {
-                    List<Result> results = ring.peekForBatchResult(128);
-                    if (results != null && !results.isEmpty()) {
-                        for (Result r : results) {
-                            CompletableFuture<Result> f = pending.remove(r.id());
-                            if (f != null) f.complete(r);
+        try {
+            while (!closed.get()) {
+                if (cqLock.tryLock()) {
+                    try {
+                        List<Result> results = ring.peekForBatchResult(128);
+                        if (results != null && !results.isEmpty()) {
+                            for (Result r : results) {
+                                CompletableFuture<Result> f = pending.remove(r.id());
+                                if (f != null) f.complete(r);
+                            }
                         }
+                    } finally {
+                        cqLock.unlock();
                     }
-                } finally {
-                    cqLock.unlock();
                 }
+                Thread.onSpinWait();
             }
-            Thread.onSpinWait();
+        } finally {
+            pollerDone.countDown();
         }
+    }
+
+    /**
+     * Starts the background poller for the async single-op path
+     * (readDirectAsync, writeAsync).  Only call this if you will NOT
+     * use BatchDispatcher methods (readFullyBatch, writeFullyBatch,
+     * or the standard positional read/write) on the same ring.
+     */
+    public synchronized void startPoller() {
+        if (poller != null) return;
+        poller = new Thread(this::pollLoop, "juring-poller");
+        poller.setDaemon(true);
+        poller.start();
     }
 
     // ==================== BATCH CONTROL (async deferred submission) ====================
@@ -706,14 +762,119 @@ public class JUringFileChannel extends FileChannel {
         return -1;
     }
 
-    // ==================== SINGLE readFully / writeFully (drop-in for H2) ====================
+    // ==================== SINGLE readFully / writeFully (direct pread/pwrite) ====================
 
+    /**
+     * Single-op readFully via direct pread(2) syscall.
+     *
+     * <p>Bypasses io_uring ring entirely — no cqLock, no submissionLock,
+     * no BatchDispatcher, no CQE matching.  This is the demand-read hot
+     * path called by H2's {@code readPage()} for every B-tree page fetch.</p>
+     *
+     * <p>Batch prefetch continues to use {@link #readFullyBatch} through
+     * the io_uring ring, where amortisation over N pages pays off.</p>
+     *
+     * <p>Handles both direct and heap ByteBuffers.  Heap buffers are
+     * bounced through a thread-local native memory segment — still far
+     * cheaper than the ring path (pread + memcpy ≈ 10-15µs vs ring
+     * lock + 2 FFI + CQE match ≈ 50-200µs).</p>
+     *
+     * <p>Follows the H2 readFully contract: on return the buffer is
+     * rewound to position 0.</p>
+     */
     public void readFully(long pos, ByteBuffer dst) throws IOException {
-        readFullyBatch(List.of(new BatchReadOp(pos, dst)));
+        int total = dst.remaining();
+        if (total == 0) { dst.rewind(); return; }
+
+        MemorySegment seg;
+        Arena tempArena = null;
+
+        if (dst.isDirect()) {
+            seg = MemorySegment.ofBuffer(dst);
+        } else if (total <= BOUNCE_BUF_SIZE) {
+            seg = bounceBuf.get().segment.asSlice(0, total);
+        } else {
+            // Rare: oversized heap buffer — allocate temp native memory
+            tempArena = Arena.ofConfined();
+            seg = tempArena.allocate(total, 4096);
+        }
+
+        try {
+            long fileOff = pos;
+            long bufOff = 0;
+            int remaining = total;
+            while (remaining > 0) {
+                long n;
+                try {
+                    n = (long) PREAD.invokeExact(rawFd, seg.asSlice(bufOff, remaining), (long) remaining, fileOff);
+                } catch (IOException e) { throw e; }
+                catch (Throwable t) { throw new IOException("pread failed", t); }
+                if (n < 0) throw new IOException("pread error " + n + " at offset " + fileOff);
+                if (n == 0) throw new EOFException("pread EOF at offset " + fileOff);
+                remaining -= (int) n;
+                fileOff += n;
+                bufOff += n;
+            }
+
+            // Copy back to heap buffer if bounced
+            if (!dst.isDirect()) {
+                MemorySegment.ofBuffer(dst).copyFrom(seg.asSlice(0, total));
+            }
+        } finally {
+            if (tempArena != null) tempArena.close();
+        }
+        dst.rewind(); // H2 readFully contract
     }
 
+    /**
+     * Single-op writeFully via direct pwrite(2) syscall.
+     *
+     * <p>Bypasses io_uring ring entirely.  Batch writes continue to use
+     * {@link #writeFullyBatch} through the ring.</p>
+     */
     public void writeFully(long pos, ByteBuffer src) throws IOException {
-        writeFullyBatch(List.of(new BatchWriteOp(pos, src)));
+        int total = src.remaining();
+        if (total == 0) return;
+
+        MemorySegment seg;
+        Arena tempArena = null;
+
+        if (src.isDirect()) {
+            seg = MemorySegment.ofBuffer(src);
+        } else {
+            // Copy heap data to native bounce buffer
+            if (total <= BOUNCE_BUF_SIZE) {
+                seg = bounceBuf.get().segment.asSlice(0, total);
+            } else {
+                tempArena = Arena.ofConfined();
+                seg = tempArena.allocate(total, 4096);
+            }
+            // heap src → native seg
+            ByteBuffer dup = src.duplicate();
+            byte[] data = new byte[total];
+            dup.get(data);
+            seg.copyFrom(MemorySegment.ofArray(data));
+        }
+
+        try {
+            long fileOff = pos;
+            long bufOff = 0;
+            int remaining = total;
+            while (remaining > 0) {
+                long n;
+                try {
+                    n = (long) PWRITE.invokeExact(rawFd, seg.asSlice(bufOff, remaining), (long) remaining, fileOff);
+                } catch (IOException e) { throw e; }
+                catch (Throwable t) { throw new IOException("pwrite failed", t); }
+                if (n < 0) throw new IOException("pwrite error " + n + " at offset " + fileOff);
+                if (n == 0) throw new IOException("pwrite zero-length at offset " + fileOff);
+                remaining -= (int) n;
+                fileOff += n;
+                bufOff += n;
+            }
+        } finally {
+            if (tempArena != null) tempArena.close();
+        }
     }
 
     // ==================== ASYNC EXTENSIONS (use poller + pending map) ====================
@@ -752,66 +913,88 @@ public class JUringFileChannel extends FileChannel {
 
     // ==================== STANDARD POSITIONAL API ====================
 
+    /**
+     * Positioned read via direct pread(2) — no ring, no locks.
+     *
+     * <p>This is the {@link FileChannel#read(ByteBuffer, long)} contract:
+     * buffer position advances by the number of bytes read, returns -1
+     * at EOF.</p>
+     */
     @Override
     public int read(ByteBuffer dst, long position) throws IOException {
         int len = dst.remaining();
         if (len == 0) return 0;
 
-        Integer fixedIdx = bufferToIndex.get(dst);
-        CompletableFuture<Result> future = new CompletableFuture<>();
+        MemorySegment seg;
+        Arena tempArena = null;
+        boolean bounce = !dst.isDirect();
 
-        synchronized (submissionLock) {
-            long id;
-            if (fixedIdx != null) {
-                id = ring.prepareReadFixed(fdIndex, len, position, fixedIdx);
-            } else {
-                id = ring.prepareRead(fdIndex, len, position);
-            }
-            pending.put(id, future);
-            submitIfNotBatching();
+        if (!bounce) {
+            seg = MemorySegment.ofBuffer(dst);
+        } else if (len <= BOUNCE_BUF_SIZE) {
+            seg = bounceBuf.get().segment.asSlice(0, len);
+        } else {
+            tempArena = Arena.ofConfined();
+            seg = tempArena.allocate(len, 4096);
         }
 
-        Result res = syncWait(future);
-        try (ReadResult rr = (ReadResult) res) {
-            int bytes = (int) rr.result();
-            if (bytes <= 0) return bytes == 0 ? -1 : bytes;
+        try {
+            long n;
+            try {
+                n = (long) PREAD.invokeExact(rawFd, seg, (long) len, position);
+            } catch (IOException e) { throw e; }
+            catch (Throwable t) { throw new IOException("pread failed", t); }
+            if (n < 0) throw new IOException("pread error: " + n);
+            if (n == 0) return -1; // EOF
 
-            if (fixedIdx == null) {
-                MemorySegment.ofBuffer(dst).copyFrom(rr.buffer().asSlice(0, bytes));
+            if (bounce) {
+                MemorySegment.ofBuffer(dst).copyFrom(seg.asSlice(0, n));
             }
-            dst.position(dst.position() + bytes);
-            return bytes;
-        } catch (Exception e) {
-            throw new RuntimeException(e);
+            dst.position(dst.position() + (int) n);
+            return (int) n;
+        } finally {
+            if (tempArena != null) tempArena.close();
         }
     }
 
+    /**
+     * Positioned write via direct pwrite(2) — no ring, no locks.
+     */
     @Override
     public int write(ByteBuffer src, long position) throws IOException {
         int len = src.remaining();
         if (len == 0) return 0;
 
-        Integer fixedIdx = bufferToIndex.get(src);
-        CompletableFuture<Result> future = new CompletableFuture<>();
+        MemorySegment seg;
+        Arena tempArena = null;
 
-        synchronized (submissionLock) {
-            long id;
-            if (fixedIdx != null) {
-                id = ring.prepareWriteFixed(fdIndex, len, position, fixedIdx);
-            } else if (src.isDirect()) {
-                id = ring.prepareWrite(fdIndex, MemorySegment.ofBuffer(src), position);
+        if (src.isDirect()) {
+            seg = MemorySegment.ofBuffer(src);
+        } else {
+            // Copy heap data to native bounce buffer
+            if (len <= BOUNCE_BUF_SIZE) {
+                seg = bounceBuf.get().segment.asSlice(0, len);
             } else {
-                byte[] data = new byte[len];
-                src.duplicate().get(data);
-                id = ring.prepareWrite(fdIndex, data, position);
+                tempArena = Arena.ofConfined();
+                seg = tempArena.allocate(len, 4096);
             }
-            pending.put(id, future);
-            submitIfNotBatching();
+            byte[] data = new byte[len];
+            src.duplicate().get(data);
+            seg.copyFrom(MemorySegment.ofArray(data));
         }
 
-        int written = (int) ((WriteResult) syncWait(future)).result();
-        if (written > 0) src.position(src.position() + written);
-        return written;
+        try {
+            long n;
+            try {
+                n = (long) PWRITE.invokeExact(rawFd, seg, (long) len, position);
+            } catch (IOException e) { throw e; }
+            catch (Throwable t) { throw new IOException("pwrite failed", t); }
+            if (n < 0) throw new IOException("pwrite error: " + n);
+            src.position(src.position() + (int) n);
+            return (int) n;
+        } finally {
+            if (tempArena != null) tempArena.close();
+        }
     }
 
     private Result syncWait(CompletableFuture<Result> future) {
@@ -827,79 +1010,39 @@ public class JUringFileChannel extends FileChannel {
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
         long currentPos = position.get();
-        List<CompletableFuture<Result>> futures = new ArrayList<>(length);
-
-        synchronized (submissionLock) {
-            for (int i = offset; i < offset + length; i++) {
-                if (!dsts[i].hasRemaining()) continue;
-                Integer bufIdx = bufferToIndex.get(dsts[i]);
-                long id;
-                if (bufIdx != null) {
-                    id = ring.prepareReadFixed(fdIndex, dsts[i].remaining(), currentPos, bufIdx);
-                } else {
-                    id = ring.prepareRead(fdIndex, dsts[i].remaining(), currentPos);
-                }
-                CompletableFuture<Result> f = new CompletableFuture<>();
-                pending.put(id, f);
-                futures.add(f);
-                currentPos += dsts[i].remaining();
-            }
-            ring.submit();
-        }
-
-        long totalRead = 0;
-        for (int i = 0; i < futures.size(); i++) {
-            try (ReadResult rr = (ReadResult) futures.get(i).join()) {
-                int bytes = (int) rr.result();
-                if (bytes > 0) {
-                    ByteBuffer dst = dsts[offset + i];
-                    if (!bufferToIndex.containsKey(dst)) {
-                        MemorySegment.ofBuffer(dst).copyFrom(rr.buffer().asSlice(0, bytes));
-                    }
-                    dst.position(dst.position() + bytes);
-                    totalRead += bytes;
-                }
-            } catch (Exception e) {
-                throw new RuntimeException(e);
+        List<BatchReadOp> ops = new ArrayList<>(length);
+        long pos = currentPos;
+        for (int i = offset; i < offset + length; i++) {
+            int rem = dsts[i].remaining();
+            if (rem > 0) {
+                ops.add(new BatchReadOp(pos, dsts[i]));
+                pos += rem;
             }
         }
-        position.addAndGet(totalRead);
-        return totalRead;
+        if (ops.isEmpty()) return 0;
+        readFullyBatch(ops);
+        long total = pos - currentPos;
+        position.addAndGet(total);
+        return total;
     }
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
         long currentPos = position.get();
-        List<CompletableFuture<Result>> futures = new ArrayList<>(length);
-
-        synchronized (submissionLock) {
-            for (int i = offset; i < offset + length; i++) {
-                if (!srcs[i].hasRemaining()) continue;
-                Integer bufIdx = bufferToIndex.get(srcs[i]);
-                long id;
-                if (bufIdx != null) {
-                    id = ring.prepareWriteFixed(fdIndex, srcs[i].remaining(), currentPos, bufIdx);
-                } else {
-                    id = ring.prepareWrite(fdIndex, MemorySegment.ofBuffer(srcs[i]), currentPos);
-                }
-                CompletableFuture<Result> f = new CompletableFuture<>();
-                pending.put(id, f);
-                futures.add(f);
-                currentPos += srcs[i].remaining();
-            }
-            ring.submit();
-        }
-
-        long totalWritten = 0;
-        for (int i = 0; i < futures.size(); i++) {
-            int w = (int) ((WriteResult) futures.get(i).join()).result();
-            if (w > 0) {
-                srcs[offset + i].position(srcs[offset + i].position() + w);
-                totalWritten += w;
+        List<BatchWriteOp> ops = new ArrayList<>(length);
+        long pos = currentPos;
+        for (int i = offset; i < offset + length; i++) {
+            int rem = srcs[i].remaining();
+            if (rem > 0) {
+                ops.add(new BatchWriteOp(pos, srcs[i]));
+                pos += rem;
             }
         }
-        position.addAndGet(totalWritten);
-        return totalWritten;
+        if (ops.isEmpty()) return 0;
+        writeFullyBatch(ops);
+        long total = pos - currentPos;
+        position.addAndGet(total);
+        return total;
     }
 
     // ==================== STATEFUL WRAPPERS ====================
@@ -971,17 +1114,41 @@ public class JUringFileChannel extends FileChannel {
     @Override protected void implCloseChannel() throws IOException {
         closed.set(true);
 
-        // The poller thread may be inside ring.peekForBatchResult() right now.
-        // We must wait for it to notice the closed flag and exit before
-        // destroying the ring — otherwise it dereferences unmapped kernel memory.
-        try {
-            poller.interrupt();   // wake it if spinning/sleeping
-            poller.join(2000);    // wait up to 2s for it to finish
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        if (poller != null) {
+            poller.interrupt();
+            try {
+                pollerDone.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
 
+        // 1. Flush dirty pages to disk before tearing down the ring.
+        //    Without this, in-flight writes (still in the page cache) can be
+        //    lost when the ring is closed — the kernel may cancel pending
+        //    SQEs and discard unflushed pages for this fd.
+        try {
+            force(true);
+        } catch (IOException e) {
+            // Best-effort; the file may already be unwritable.
+        }
+
+        // 2. Tear down the io_uring ring (cancels any pending SQEs, frees
+        //    kernel resources).
         synchronized (submissionLock) { ring.close(); }
+
+        // 3. Close the raw file descriptor.  ring.close() unregisters it
+        //    from the ring but does NOT close the underlying fd.
+        try {
+            int res = (int) POSIX_CLOSE.invokeExact(rawFd);
+            if (res < 0) {
+                throw new IOException("close(fd=" + rawFd + ") failed: " + res);
+            }
+        } catch (IOException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IOException("close(fd=" + rawFd + ") failed", t);
+        }
     }
 
     // ==================== ZERO-COPY TRANSFER ====================
@@ -1022,10 +1189,12 @@ public class JUringFileChannel extends FileChannel {
      * <p>Total: {@code TRANSFER_PIPELINE_DEPTH × BUFFERED_CHUNK} = 4 MB per thread.</p>
      */
     private static class TransferBuffers {
+        final Arena arena;                 // FIX: retain Arena — same GC bug as BatchArrays
         final MemorySegment[] segments;    // page-aligned native memory
         final ByteBuffer[] byteBuffers;    // pre-wrapped views for external channel I/O
 
-        TransferBuffers(Arena arena, int count, int chunkSize) {
+        TransferBuffers(int count, int chunkSize) {
+            this.arena = Arena.ofAuto();   // stored — kept alive by this object
             segments = new MemorySegment[count];
             byteBuffers = new ByteBuffer[count];
             for (int i = 0; i < count; i++) {
@@ -1036,7 +1205,35 @@ public class JUringFileChannel extends FileChannel {
     }
 
     private final ThreadLocal<TransferBuffers> transferBuffers = ThreadLocal.withInitial(
-            () -> new TransferBuffers(Arena.ofAuto(), TRANSFER_PIPELINE_DEPTH, BUFFERED_CHUNK));
+            () -> new TransferBuffers(TRANSFER_PIPELINE_DEPTH, BUFFERED_CHUNK));
+
+    // ==================== BOUNCE BUFFER FOR HEAP pread/pwrite ====================
+
+    /**
+     * Thread-local native memory bounce buffer for pread/pwrite with heap
+     * ByteBuffers.  H2's MVStore allocates heap ByteBuffers for page I/O,
+     * but pread/pwrite require native-memory addresses.  Instead of falling
+     * back to the io_uring ring (50-200µs overhead), we bounce through this
+     * pre-allocated segment (pread + memcpy ≈ 10-15µs).
+     *
+     * <p>Size: 64 KB covers H2's max page size (default 16 KB, max 2 MB
+     * but PAGE_LARGE uses a different path).  For the rare case of a
+     * buffer larger than 64 KB, falls back to a temp Arena allocation.</p>
+     */
+    private static final int BOUNCE_BUF_SIZE = 64 * 1024;
+    // FIX: wrapping the segment in a holder that keeps the Arena alive.
+    // Arena.ofAuto().allocate(...) used to discard the Arena immediately — the
+    // GC Cleaner then freed the native page, turning the MemorySegment dangling.
+    private static class BounceBuffer {
+        final Arena arena;
+        final MemorySegment segment;
+        BounceBuffer(int size) {
+            this.arena   = Arena.ofAuto();
+            this.segment = arena.allocate(size, 4096);
+        }
+    }
+    private static final ThreadLocal<BounceBuffer> bounceBuf = ThreadLocal.withInitial(
+            () -> new BounceBuffer(BOUNCE_BUF_SIZE));
 
     /**
      * Transfers bytes from this channel to the target.
@@ -1482,20 +1679,16 @@ public class JUringFileChannel extends FileChannel {
 
     @Override
     public void force(boolean meta) throws IOException {
-        CompletableFuture<Result> future = new CompletableFuture<>();
-        // IORING_FSYNC_DATASYNC is bit 0 (value 1). If meta is false, we use datasync.
-        int flags = meta ? 0 : 1;
-
-        synchronized (submissionLock) {
-            long id = ring.prepareFsync(fdIndex, flags, SqeOptions.IOSQE_FIXED_FILE);
-            pending.put(id, future);
-            submitIfNotBatching();
-        }
-
-        // Reuse your existing syncWait logic to block until the poller finds the result
-        Result res = syncWait(future);
-        if (res.id() < 0) {
-            throw new IOException("io_uring fsync failed: " + res.id());
+        // Direct syscall — avoids CQ ring user_data format conflict.
+        // Also, faster than submit+wait+peek for a single fsync.
+        try {
+            int res = meta ? (int) FSYNC.invokeExact(rawFd)
+                           : (int) FDATASYNC.invokeExact(rawFd);
+            if (res < 0) throw new IOException("fsync failed: " + res);
+        } catch (IOException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new IOException(t);
         }
     }
 
