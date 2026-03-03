@@ -284,6 +284,13 @@ public class JUringFileChannel extends FileChannel {
         return ring.cqCapacity() - ring.cqReady();
     }
 
+    public boolean isBusy() {
+        // CQ is typically 2× queue depth (QUEUE_DEPTH=4096 → cqCapacity≈8192).
+        // Once more than half the CQ is filled with unreaped completions,
+        // submitting more speculative SQEs risks stalling demand reads.
+        return ring.cqReady() > ring.cqCapacity() / 4;
+    }
+
     /**
      * Instrumented writeFullyBatch. phaseTimesOut must be long[5]:
      *   [0] = array fill, [1] = prepare, [2] = submitAndCollect, [3] = result check, [4] = total
