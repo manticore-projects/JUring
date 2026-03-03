@@ -58,9 +58,9 @@ import java.util.concurrent.TimeUnit;
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
 @State(Scope.Benchmark)
-@Warmup(iterations = 1, time = 2)
-@Measurement(iterations = 2, time = 5)
-@Fork(value = 1, jvmArgs = {"-Xms2g", "-Xmx2g", "--add-modules=jdk.unsupported"})
+@Warmup(iterations = 2, time = 5)
+@Measurement(iterations = 5, time = 5)
+@Fork(value = 3, jvmArgs = {"-Xms2g", "-Xmx2g", "--add-modules=jdk.unsupported"})
 public class DBPatterns {
 
     private static final int FILE_SIZE_MB = 512;  // 1GB — must exceed NVMe DRAM cache (~256MB-1GB)
@@ -135,6 +135,8 @@ public class DBPatterns {
         juringChannel = com.davidvlijmincx.lio.channel.JUringFileChannel.open(testFile,
                                                                               LinuxOpenOptions.READ_DIRECT,
                                                                               LinuxOpenOptions.WRITE_DIRECT);
+
+        juringChannel.startPoller();
 
         // Pre-allocate single buffers for sync benchmarks (4096-aligned for O_DIRECT)
         bufferArena = Arena.ofShared();

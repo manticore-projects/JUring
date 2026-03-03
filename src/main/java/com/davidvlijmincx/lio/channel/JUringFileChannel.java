@@ -274,6 +274,16 @@ public class JUringFileChannel extends FileChannel {
     public int getFdIndex() { return fdIndex; }
     public int getRawFd() { return rawFd; }
 
+    public static final int PREFETCH_MIN_SQ_SLACK = 64; // reserve for sync reads
+
+    public int availableSqCapacity() {
+        return ring.sqCapacity() - ring.sqPending();
+    }
+
+    public int availableCqCapacity() {
+        return ring.cqCapacity() - ring.cqReady();
+    }
+
     /**
      * Instrumented writeFullyBatch. phaseTimesOut must be long[5]:
      *   [0] = array fill, [1] = prepare, [2] = submitAndCollect, [3] = result check, [4] = total

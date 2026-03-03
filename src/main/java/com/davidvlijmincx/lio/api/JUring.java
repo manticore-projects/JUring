@@ -305,6 +305,61 @@ public class JUring implements AutoCloseable {
     }
 
 
+    // ==================== RING INTROSPECTION ====================
+
+    /**
+     * Number of SQEs prepared but not yet submitted.
+     *
+     * Reads sq.sqe_tail - sq.sqe_head directly from the ring struct.
+     * Non-zero between a prepare call and the next {@link #submit()}.
+     */
+    public int sqReady() {
+        return ioUring.sqReady();
+    }
+
+    /**
+     * Alias for sqReady(). Returns SQEs prepared but not yet submitted.
+     * Use as: sqCapacity() - sqPending() to get available SQ slots.
+     */
+    public int sqPending() {
+        return ioUring.sqPending();
+    }
+
+    /**
+     * Total SQ capacity (sq.ring_entries) — the queue depth the ring was
+     * created with.
+     */
+    public int sqCapacity() {
+        return ioUring.sqCapacity();
+    }
+
+    /**
+     * Number of CQEs posted by the kernel but not yet reaped by userspace.
+     *
+     * This is the primary backpressure signal. When the async prefetch path
+     * submits SQEs without a running poller, this value grows monotonically.
+     * Once it reaches {@link #cqCapacity()}, new submissions stall until
+     * completions are drained.
+     *
+     * Use this to throttle speculative prefetch:
+     * <pre>
+     *   if (ring.cqReady() > ring.cqCapacity() / 2) {
+     *       // skip this prefetch batch — ring is under pressure
+     *   }
+     * </pre>
+     */
+    public int cqReady() {
+        return ioUring.cqReady();
+    }
+
+    /**
+     * Total CQ capacity (cq.ring_entries).
+     * Typically 2× the queue depth the ring was created with.
+     */
+    public int cqCapacity() {
+        return ioUring.cqCapacity();
+    }
+
     // io_uring opcodes
     private static final byte IORING_OP_FSYNC = 1;
 

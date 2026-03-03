@@ -132,31 +132,31 @@ record LibUringDispatcher(Arena arena,
 
     private static LibUringDispatcher getDispatcher(MemorySegment ring) {
         return new LibUringDispatcher(Arena.ofShared(),ring, libCDispatcher.alloc(AddressLayout.ADDRESS.byteSize()), libCDispatcher.alloc(AddressLayout.ADDRESS.byteSize() * 500),
-                libLink(GetSqe.class, "io_uring_get_sqe", FunctionDescriptor.of(ADDRESS, ADDRESS), true),
-                libLink(SetSqeFlag.class, "io_uring_sqe_set_flags", FunctionDescriptor.ofVoid(C_POINTER, JAVA_BYTE), true),
-                libLink(PrepOpenAt.class, "io_uring_prep_openat", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_INT, JAVA_INT), false),
-                libLink(PrepareOpenDirect.class, "io_uring_prep_openat_direct", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_INT, JAVA_INT, JAVA_INT), false),
-                libLink(PrepareClose.class, "io_uring_prep_close", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT), false),
-                libLink(PrepareCloseDirect.class, "io_uring_prep_close_direct", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT), false),
-                libLink(PrepareRead.class, "io_uring_prep_read", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG), false),
-                libLink(PrepareReadFixed.class, "io_uring_prep_read_fixed", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG, JAVA_INT), false),
-                libLink(PrepareWrite.class, "io_uring_prep_write", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG), false),
-                libLink(PrepareWriteFixed.class, "io_uring_prep_write_fixed", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG, JAVA_INT), false),
-                libLink(Submit.class, "io_uring_submit", FunctionDescriptor.of(JAVA_INT, ADDRESS), true),
-                libLink(WaitCqe.class, "io_uring_wait_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER), false),
-                libLink(PeekCqe.class, "io_uring_peek_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER), false),
-                libLink(PeekBatchCqe.class, "io_uring_peek_batch_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
-                libLink(CqeSeen.class, "io_uring_cqe_seen", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), true),
-                libLink(QueueInit.class, "io_uring_queue_init", FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT), false),
-                libLink(QueueInitParams.class, "io_uring_queue_init_params", FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS), false),
-                libLink(QueueExit.class, "io_uring_queue_exit", FunctionDescriptor.ofVoid(ADDRESS), false),
-                libLink(SqeSetData.class, "io_uring_sqe_set_data", FunctionDescriptor.ofVoid(C_POINTER, JAVA_LONG), false),
-                libLink(RegisterBuffers.class, "io_uring_register_buffers", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
-                libLink(RegisterFiles.class, "io_uring_register_files", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
-                libLink(RegisterFilesUpdate.class, "io_uring_register_files_update", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, C_POINTER, JAVA_INT), false),
-                libLink(CqAdvance.class, "io_uring_cq_advance", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT), true),
-                libLink(WaitCqeNr.class, "io_uring_wait_cqe_nr", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
-                libLink(RegisterIowqMaxWorkers.class, "io_uring_register_iowq_max_workers", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), false)
+                                      libLink(GetSqe.class, "io_uring_get_sqe", FunctionDescriptor.of(ADDRESS, ADDRESS), true),
+                                      libLink(SetSqeFlag.class, "io_uring_sqe_set_flags", FunctionDescriptor.ofVoid(C_POINTER, JAVA_BYTE), true),
+                                      libLink(PrepOpenAt.class, "io_uring_prep_openat", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_INT, JAVA_INT), false),
+                                      libLink(PrepareOpenDirect.class, "io_uring_prep_openat_direct", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_INT, JAVA_INT, JAVA_INT), false),
+                                      libLink(PrepareClose.class, "io_uring_prep_close", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT), false),
+                                      libLink(PrepareCloseDirect.class, "io_uring_prep_close_direct", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT), false),
+                                      libLink(PrepareRead.class, "io_uring_prep_read", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG), false),
+                                      libLink(PrepareReadFixed.class, "io_uring_prep_read_fixed", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG, JAVA_INT), false),
+                                      libLink(PrepareWrite.class, "io_uring_prep_write", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG), false),
+                                      libLink(PrepareWriteFixed.class, "io_uring_prep_write_fixed", FunctionDescriptor.ofVoid(C_POINTER, JAVA_INT, C_POINTER, JAVA_LONG, JAVA_LONG, JAVA_INT), false),
+                                      libLink(Submit.class, "io_uring_submit", FunctionDescriptor.of(JAVA_INT, ADDRESS), true),
+                                      libLink(WaitCqe.class, "io_uring_wait_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER), false),
+                                      libLink(PeekCqe.class, "io_uring_peek_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER), false),
+                                      libLink(PeekBatchCqe.class, "io_uring_peek_batch_cqe", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
+                                      libLink(CqeSeen.class, "io_uring_cqe_seen", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), true),
+                                      libLink(QueueInit.class, "io_uring_queue_init", FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT), false),
+                                      libLink(QueueInitParams.class, "io_uring_queue_init_params", FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS), false),
+                                      libLink(QueueExit.class, "io_uring_queue_exit", FunctionDescriptor.ofVoid(ADDRESS), false),
+                                      libLink(SqeSetData.class, "io_uring_sqe_set_data", FunctionDescriptor.ofVoid(C_POINTER, JAVA_LONG), false),
+                                      libLink(RegisterBuffers.class, "io_uring_register_buffers", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
+                                      libLink(RegisterFiles.class, "io_uring_register_files", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
+                                      libLink(RegisterFilesUpdate.class, "io_uring_register_files_update", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, C_POINTER, JAVA_INT), false),
+                                      libLink(CqAdvance.class, "io_uring_cq_advance", FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT), true),
+                                      libLink(WaitCqeNr.class, "io_uring_wait_cqe_nr", FunctionDescriptor.of(JAVA_INT, ADDRESS, C_POINTER, JAVA_INT), false),
+                                      libLink(RegisterIowqMaxWorkers.class, "io_uring_register_iowq_max_workers", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), false)
         );
     }
 
@@ -437,6 +437,69 @@ record LibUringDispatcher(Arena arena,
         libCDispatcher.free(cqePtr);
         libCDispatcher.free(cqePtrPtr);
         closeArena();
+    }
+
+    /**
+     * Number of SQEs prepared (via io_uring_get_sqe) but not yet submitted.
+     *
+     * Reads sq.sqe_tail - sq.sqe_head directly from the ring struct.
+     * These are Java-side counters maintained by liburing — no kernel
+     * dereference required.
+     */
+    int sqReady() {
+        long sqBase = ring_layout.byteOffset(MemoryLayout.PathElement.groupElement("sq"));
+        long headOff = sqBase + io_uring_sq_layout.byteOffset(MemoryLayout.PathElement.groupElement("sqe_head"));
+        long tailOff = sqBase + io_uring_sq_layout.byteOffset(MemoryLayout.PathElement.groupElement("sqe_tail"));
+        int head = ring.get(JAVA_INT, headOff);
+        int tail = ring.get(JAVA_INT, tailOff);
+        return tail - head;
+    }
+
+    /**
+     * Alias for sqReady(). Returns SQEs prepared but not yet submitted.
+     * Use as: sqCapacity() - sqPending() to get available SQ slots.
+     */
+    int sqPending() {
+        return sqReady();
+    }
+
+    /**
+     * Total SQ capacity (sq.ring_entries).
+     */
+    int sqCapacity() {
+        long sqBase = ring_layout.byteOffset(MemoryLayout.PathElement.groupElement("sq"));
+        long off = sqBase + io_uring_sq_layout.byteOffset(MemoryLayout.PathElement.groupElement("ring_entries"));
+        return ring.get(JAVA_INT, off);
+    }
+
+    /**
+     * Number of CQEs posted by the kernel but not yet reaped by userspace.
+     *
+     * cq.ktail and cq.khead are pointers into the shared mmap region —
+     * they must be dereferenced to obtain the current head/tail uint32 values.
+     * The difference is the number of completions waiting to be consumed.
+     *
+     * This is the primary backpressure metric: if cqReady() is growing,
+     * SQEs are being submitted faster than completions are being reaped,
+     * which will eventually fill the CQ and stall new submissions.
+     */
+    int cqReady() {
+        long cqBase = ring_layout.byteOffset(MemoryLayout.PathElement.groupElement("cq"));
+        long kheadPtrOff = cqBase + io_uring_cq_layout.byteOffset(MemoryLayout.PathElement.groupElement("khead"));
+        long ktailPtrOff = cqBase + io_uring_cq_layout.byteOffset(MemoryLayout.PathElement.groupElement("ktail"));
+        // Each is a C_POINTER (pointer to volatile uint32 in shared memory)
+        int head = ring.get(C_POINTER, kheadPtrOff).reinterpret(JAVA_INT.byteSize()).get(JAVA_INT, 0);
+        int tail = ring.get(C_POINTER, ktailPtrOff).reinterpret(JAVA_INT.byteSize()).get(JAVA_INT, 0);
+        return tail - head;
+    }
+
+    /**
+     * Total CQ capacity (cq.ring_entries).
+     */
+    int cqCapacity() {
+        long cqBase = ring_layout.byteOffset(MemoryLayout.PathElement.groupElement("cq"));
+        long off = cqBase + io_uring_cq_layout.byteOffset(MemoryLayout.PathElement.groupElement("ring_entries"));
+        return ring.get(JAVA_INT, off);
     }
 
     /**
